@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trajtest"
+version = "0.1.1"
+description = "pytest for agent trajectories: assert on what an agent did, not just what it said"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Calas Automations" }]
+keywords = ["agents", "eval", "evals", "testing", "trajectory", "pytest"]
+dependencies = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://calasautomations.com"
+
+[project.scripts]
+trajtest = "trajtest.cli:main"
+
+[project.entry-points.pytest11]
+trajtest = "trajtest.pytest_plugin"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

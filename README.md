@@ -1,0 +1,139 @@
+# trajtest — pytest for agent trajectories
+
+**Assert on what an agent *did*, not just what it *said*.**
+
+`trajtest` runs an agent against a mock world (in-memory FS, mock HTTP, KV
+store) and lets you assert on its **trajectory** — which tools it called, in
+what order, with what arguments, and what side effects it left behind.
+Deterministic. Local-first. No LLM-as-judge. CI-ready.
+
+```python
+from trajtest import Expect, World, run
+
+def my_agent(task, tools):
+    rows = tools.http_get("https://api.example.com/rows").json()["rows"]
+    tools.fs_write("/out/report.md", f"total: {sum(rows)}")
+    return "done"
+
+def test_agent_saves_before_claiming():
+    world = World()
+    world.http.mock("GET", "https://api.example.com/rows", json={"rows": [1, 2, 3]})
+
+    traj = run(my_agent, "summarize the rows", world, max_steps=15)
+
+    (Expect(traj)
+        .called("http_get", url__contains="api.example.com")
+        .then("fs_write", path="/out/report.md")
+        .never_called("fs_delete")
+        .completed_within(15)
+        .finished()
+        .world_file("/out/report.md", equals="total: 6")  # the world, not the narration
+        .assert_all())
+```
+
+## Why
+
+Prompt-tests can't see the four ways agents actually fail:
+
+1. **Confident false reports** — the agent says "saved the file" but never
+   called write. `world_file()` checks the mock world's final state, not the
+   narration.
+2. **Silent policy violations** — narration says "I'll be careful", tool calls
+   did a delete. `never_called("fs_delete")` catches it.
+3. **Evidence-free passes** — 94% pass rate, nobody knows what was verified.
+   Every `EvalFailure` lists each assertion's outcome plus the full trajectory
+   transcript. An eval with zero assertions **fails loudly**.
+4. **Meaningless coverage** — green suite, dangerous tools never exercised.
+   `traj.unused_tools(TOOLS)` flags what the agent never touched.
+
+## Install
+
+```bash
+pip install trajtest
+```
+
+## Core concepts
+
+**World** — the mock environment. Strict by design: missing files raise
+`FileNotFoundError`, unmocked HTTP raises `UnmockedRequestError`. A world
+that forgives everything produces agents that pass evals and fail in prod.
+
+- `world.fs` — in-memory filesystem (`read`/`write`/`append`/`delete`/
+  `exists`/`listdir`/`glob`; str or bytes; `**` glob support)
+- `world.http` — mock HTTP (`mock(method, url, status=..., json=...,
+  text=..., error="timeout"|"connection", times=n)`; exact then `*`
+  wildcard matching; repeated mocks form a consumable queue — mock a 500
+  then a 200 to test retry logic)
+- `world.kv` — key-value scratch space; `world.clock` — controllable clock
+- `world.reset()` — wipe everything between scenarios
+
+**run(agent, task, world, max_steps=25, seed=None)** — the agent is a plain
+function `(task, tools) -> str`. Every tool call is recorded (name, args,
+result, duration, errors). Tool errors are recorded *and* re-raised, so the
+agent can react to them. `tools.note("...")` captures narration separately —
+notes are never steps and never pollute sequences, so you can compare what
+the agent *said* against what it *did*. Crashes become `traj.finished=False`
+with `traj.failure` set; exceeding `max_steps` is a trajectory failure, not
+a hang.
+
+**sample(agent, task, world_factory, n=5)** — for stochastic agents: n runs
+against fresh worlds. Seeds are passed when the agent accepts a `seed`
+keyword. Assert consistency with a loop:
+
+```python
+for t in sample(agent, "task", make_world, n=5):
+    Expect(t).never_called("fs_delete").completed_within(15).assert_all()
+```
+
+**Expect(traj)** — the assertion DSL. All methods chain; `assert_all()`
+reports *every* failure at once (fail-collecting, not fail-fast):
+
+| Assertion | Meaning |
+|---|---|
+| `called(name, *args, **kwargs)` | ≥1 call matching (positional prefix, kwarg subset, matchers ok) |
+| `called_times / at_least / at_most` | call counts |
+| `never_called(name, ...)` | forbids calls (optionally arg-scoped) |
+| `in_order(a, b, c)` | ordered subsequence, gaps allowed |
+| `then(name, ...)` | fluent chain: must occur after previous `then` |
+| `then_immediately(name, ...)` | strict adjacency required |
+| `first / last` | boundary calls |
+| `completed_within(n)` / `finished()` | step budget / clean completion |
+| `final_answer(matcher-or-value)` | the agent's return value |
+| `notes_contain / notes_match` | narration assertions |
+| `world_file(path, equals/contains/matches)` | final world state — the anti-lying assertion |
+| `world(desc, predicate)` / `custom(desc, fn)` | escape hatches |
+
+Kwarg matching uses **parameter names**, so `called("http_get",
+url__contains="api.example.com")` works whether the agent passed the URL
+positionally or by keyword. Suffix sugar: `__contains __regex
+__startswith __endswith __gt __lt __ge __le`. Matchers (`ANY`, `Contains`,
+`Regex`, `StartsWith`, `EndsWith`, `Gt/Lt/Ge/Le`, `InstanceOf`,
+`Predicate`, `DictSubset`) compose anywhere.
+
+**pytest plugin** — a `world` fixture (fresh `World` per test) is
+auto-registered. **CLI** — `trajtest init` scaffolds an example eval;
+`trajtest run <path>` runs evals through pytest.
+
+## Limitations (honest)
+
+- **trajtest can't tell you your assertions are meaningful.**
+  `Expect(t).finished().assert_all()` is a weak eval and it will pass.
+  Assert on trajectories and world state, not vibes.
+- **The mock world is not the real world.** No network latency, no real
+  filesystem permissions, no file metadata (size/mtime), no concurrent
+  access. Fidelity gaps are where false confidence breeds — keep mocks
+  strict and review them.
+- **Deterministic assertions vs stochastic agents** is an inherent tension.
+  Use `sample()`, seeds, and order-flexible assertions. If your agent is
+  wildly non-deterministic, trajectory evals will be brittle — that's a
+  signal about the agent, not just the eval.
+- **Single-threaded.** Agents that spawn threads or subprocesses calling
+  tools concurrently are not supported.
+- **No framework adapters in v1.** The agent is `(task, tools) -> str`;
+  wrapping a LangChain/CrewAI loop takes ~5 lines on your side.
+- **No LLM-as-judge**, by design. Semantic judgments belong in a custom
+  `predicate`, not in the core.
+
+## License
+
+MIT
