@@ -1,5 +1,0 @@
-[console_scripts]
-trajtest = trajtest.cli:main
-
-[pytest11]
-trajtest = trajtest.pytest_plugin

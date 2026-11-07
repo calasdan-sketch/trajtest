@@ -12,14 +12,19 @@ name, arguments, result, duration and any error. The mock world supplies the
 results. No framework SDK required.
 """
 
+import asyncio
 import inspect
+import re
+import threading
 import time
 from dataclasses import dataclass, field
 
 from trajtest.errors import MaxStepsExceeded
+from trajtest.sanitize import clean
 from trajtest.world import World
 
 _RESULT_REPR_LIMIT = 500
+_LINE_LIMIT = 1000
 
 
 @dataclass
@@ -42,7 +47,11 @@ class ToolCall:
         arg_strs = [repr(a) for a in self.args]
         arg_strs += [f"{k}={v!r}" for k, v in self.kwargs.items()]
         err = f" !! {self.error}" if self.error else ""
-        return f"#{self.step} {self.name}({', '.join(arg_strs)}){err}"
+        # Untrusted text: secrets masked, control/bidi/newline chars escaped.
+        line = clean(f"#{self.step} {self.name}({', '.join(arg_strs)}){err}")
+        if len(line) > _LINE_LIMIT:
+            line = line[:_LINE_LIMIT] + f"…(+{len(line) - _LINE_LIMIT} chars)"
+        return line
 
 
 @dataclass
@@ -64,6 +73,12 @@ class Trajectory:
     failure: str | None = None
     max_steps: int = 25
     world: "World | None" = field(default=None, repr=False)
+    registered: "list[str] | None" = None
+    """Every tool name that existed for this run (built-ins + custom).
+
+    None means unknown (e.g. an imported trace without a tool list): name
+    typo checks are skipped rather than guessed.
+    """
 
     @property
     def steps(self) -> int:
@@ -73,15 +88,54 @@ class Trajectory:
     def tool_names(self) -> list[str]:
         return [c.name for c in self.calls]
 
+    def to_dict(self) -> dict:
+        """JSON-safe snapshot (lossy: non-JSON values become their repr)."""
+        from trajtest import traces
+
+        return traces.to_dict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Trajectory":
+        from trajtest import traces
+
+        return traces.from_dict(data)
+
+    def save(self, path) -> None:
+        """Write the trajectory as JSON (e.g. a golden/baseline trace)."""
+        from trajtest import traces
+
+        traces.save(self, path)
+
+    @classmethod
+    def load(cls, path) -> "Trajectory":
+        from trajtest import traces
+
+        return traces.load(path)
+
+    @classmethod
+    def from_openai_messages(cls, messages, tools=None) -> "Trajectory":
+        from trajtest import traces
+
+        return traces.from_openai_messages(messages, tools)
+
+    @classmethod
+    def from_anthropic_messages(cls, messages, tools=None) -> "Trajectory":
+        from trajtest import traces
+
+        return traces.from_anthropic_messages(messages, tools)
+
     def calls_to(self, name: str) -> list[ToolCall]:
         return [c for c in self.calls if c.name == name]
 
-    def unused_tools(self, registered: list[str]) -> list[str]:
+    def unused_tools(self, registered: "list[str] | None" = None) -> list[str]:
         """Tools that exist but the agent never touched.
 
         Counters meaningless coverage: a green eval suite where the
         dangerous tools were never exercised is not evidence of safety.
+        Defaults to this run's own tool list (built-ins + custom tools).
         """
+        if registered is None:
+            registered = self.registered or []
         used = set(self.tool_names)
         return [t for t in registered if t not in used]
 
@@ -90,17 +144,21 @@ class Trajectory:
         for call in self.calls:
             lines.append(call.short())
         for note in self.notes:
-            lines.append(f"(note @ step {note.step}) {note.text}")
+            lines.append(clean(f"(note @ step {note.step}) {note.text}"))
         lines.append(
-            f"-> finished={self.finished} steps={self.steps} "
-            f"answer={self.final_answer!r}"
-            + (f" failure={self.failure!r}" if self.failure else "")
+            clean(
+                f"-> finished={self.finished} steps={self.steps} "
+                f"answer={self.final_answer!r}"
+                + (f" failure={self.failure!r}" if self.failure else "")
+            )
         )
         return "\n".join(lines)
 
 
 def _truncate_repr(value) -> str:
-    text = repr(value)
+    from trajtest.sanitize import redact
+
+    text = redact(repr(value))
     if len(text) > _RESULT_REPR_LIMIT:
         return text[:_RESULT_REPR_LIMIT] + "…"
     return text
@@ -130,10 +188,18 @@ class _Tools:
         "note",
     )
 
-    def __init__(self, world: World, trajectory: Trajectory, max_steps: int):
+    def __init__(
+        self,
+        world: World,
+        trajectory: Trajectory,
+        max_steps: int,
+        extra: "dict | None" = None,
+    ):
         self._world = world
         self._traj = trajectory
         self._max_steps = max_steps
+        self._lock = threading.RLock()
+        self._wrapped: dict = {}
         self._impls = {
             "fs_read": world.fs.read,
             "fs_write": world.fs.write,
@@ -152,28 +218,53 @@ class _Tools:
             "kv_set": world.kv.set,
             "kv_delete": world.kv.delete,
         }
+        for name, fn in (extra or {}).items():
+            _check_tool_name(name)
+            if name in self._impls or name == "note":
+                raise ValueError(
+                    f"custom tool {name!r} would shadow a built-in trajtest tool"
+                )
+            if not callable(fn):
+                raise TypeError(f"custom tool {name!r} must be callable")
+            self._impls[name] = fn
 
     def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
         if name == "note":
             return self._note
-        if name in self._impls:
-            return self._wrap(name, self._impls[name])
+        impls = self.__dict__.get("_impls", {})
+        if name in impls:
+            # cache: one wrapper (and one signature inspection) per tool
+            cache = self.__dict__["_wrapped"]
+            if name not in cache:
+                cache[name] = self._wrap(name, impls[name])
+            return cache[name]
         raise AttributeError(f"trajtest has no tool {name!r}")
 
     def _note(self, text: str) -> None:
-        self._traj.notes.append(Note(step=len(self._traj.calls), text=str(text)))
+        with self._lock:
+            self._traj.notes.append(Note(step=len(self._traj.calls), text=str(text)))
 
     @staticmethod
-    def _bind_args(fn, args, kwargs) -> dict:
+    def _signature(fn):
+        try:
+            return inspect.signature(fn)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _bind_args(sig, args, kwargs) -> dict:
         """Bind positional args to parameter names; flatten **kwargs.
 
-        Returns {} when the signature can't be inspected — callers fall
-        back to raw args/kwargs matching.
+        Returns {} when the signature can't be inspected or the call does
+        not fit it — callers fall back to raw args/kwargs matching.
         """
+        if sig is None:
+            return {}
         try:
-            sig = inspect.signature(fn)
             bound = sig.bind_partial(*args, **kwargs)
-        except (TypeError, ValueError):
+        except TypeError:
             return {}
         flat: dict = {}
         for name, param in sig.parameters.items():
@@ -186,46 +277,85 @@ class _Tools:
         return flat
 
     def _wrap(self, name, fn):
-        def recorded(*args, **kwargs):
-            if len(self._traj.calls) >= self._max_steps:
-                raise MaxStepsExceeded(
-                    f"agent exceeded max_steps={self._max_steps} (last tool: {name})"
-                )
-            start = time.perf_counter()
-            bound = self._bind_args(fn, args, kwargs)
-            try:
-                result = fn(*args, **kwargs)
-            except Exception as exc:
-                # Record the failed call, then let the agent see the error —
-                # agents that never face errors in evals fall over in prod.
+        sig = self._signature(fn)
+
+        def record(args, kwargs, bound, result, start, error=None):
+            # Step numbering and the budget check are atomic so threads
+            # cannot produce duplicate step ids.
+            with self._lock:
                 self._traj.calls.append(
                     ToolCall(
                         step=len(self._traj.calls) + 1,
                         name=name,
                         args=args,
                         kwargs=kwargs,
-                        result_repr="",
+                        result_repr="" if error else _truncate_repr(result),
                         duration_ms=(time.perf_counter() - start) * 1000,
-                        error=f"{type(exc).__name__}: {exc}",
+                        error=error,
                         bound=bound,
                     )
                 )
+
+        def recorded(*args, **kwargs):
+            with self._lock:
+                if len(self._traj.calls) >= self._max_steps:
+                    raise MaxStepsExceeded(
+                        f"agent exceeded max_steps={self._max_steps} "
+                        f"(last tool: {name})"
+                    )
+            start = time.perf_counter()
+            bound = self._bind_args(sig, args, kwargs)
+            try:
+                result = fn(*args, **kwargs)
+            except Exception as exc:
+                # Record the failed call, then let the agent see the error —
+                # agents that never face errors in evals fall over in prod.
+                record(args, kwargs, bound, None, start, f"{type(exc).__name__}: {exc}")
                 raise
-            self._traj.calls.append(
-                ToolCall(
-                    step=len(self._traj.calls) + 1,
-                    name=name,
-                    args=args,
-                    kwargs=kwargs,
-                    result_repr=_truncate_repr(result),
-                    duration_ms=(time.perf_counter() - start) * 1000,
-                    bound=bound,
-                )
-            )
+            record(args, kwargs, bound, result, start)
             return result
 
         recorded.__name__ = name
         return recorded
+
+
+_TOOL_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+def _check_tool_name(name) -> None:
+    if not isinstance(name, str) or not _TOOL_NAME.match(name) or name.startswith("_"):
+        raise ValueError(
+            f"invalid custom tool name {name!r}: use letters, digits, underscore"
+        )
+
+
+def flaky(fn, *, fail_times: int = 1, error: Exception | None = None):
+    """Wrap a custom tool so its first `fail_times` calls raise.
+
+    Lets evals prove an agent retries or degrades gracefully::
+
+        tools = {"send_email": flaky(send, fail_times=2, error=TimeoutError("smtp"))}
+    """
+    if fail_times < 0:
+        raise ValueError("fail_times must be >= 0")
+    state = {"left": fail_times}
+    lock = threading.Lock()
+
+    def wrapper(*args, **kwargs):
+        with lock:
+            fail = state["left"] > 0
+            if fail:
+                state["left"] -= 1
+        if fail:
+            raise error if error is not None else RuntimeError("injected failure")
+        return fn(*args, **kwargs)
+
+    try:
+        wrapper.__signature__ = inspect.signature(fn)  # keep param-name matching
+    except (TypeError, ValueError):
+        pass
+    wrapper.__name__ = getattr(fn, "__name__", "flaky_tool")
+    return wrapper
 
 
 #: Every tool name trajtest exposes. Use with Trajectory.unused_tools()
@@ -252,19 +382,57 @@ def _accepts_seed(agent) -> bool:
 
 
 def _call_agent(agent, task: str, tools, seed):
-    """Invoke the agent, injecting seed only if it accepts one."""
-    if seed is None:
-        return agent(task, tools)
-    return agent(task, tools, seed=seed)
+    """Invoke the agent, injecting seed only if it accepts one.
+
+    Async agents (coroutine functions, or anything returning an awaitable)
+    are driven to completion on a private event loop in a worker thread, so
+    this also works inside an already-running loop (pytest-asyncio). v0.1
+    silently "finished" with an un-awaited coroutine and zero steps, a false
+    pass. Tools stay synchronous: call them directly inside the coroutine.
+    """
+    result = agent(task, tools) if seed is None else agent(task, tools, seed=seed)
+    if inspect.isawaitable(result):
+        return _drive_awaitable(result)
+    return result
+
+
+def _drive_awaitable(awaitable):
+    box: dict = {}
+
+    async def main():
+        return await awaitable
+
+    def target():
+        try:
+            box["value"] = asyncio.run(main())
+        except BaseException as exc:  # noqa: BLE001 - re-raised in caller
+            box["error"] = exc
+
+    th = threading.Thread(target=target, name="trajtest-async-agent")
+    th.start()
+    th.join()
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
 
 
 def run(
-    agent, task: str, world: World, *, max_steps: int = 25, seed=None
+    agent,
+    task: str,
+    world: World,
+    *,
+    max_steps: int = 25,
+    seed=None,
+    tools: "dict | None" = None,
 ) -> Trajectory:
     """Run an agent against a mock world; record its trajectory.
 
-    agent: callable (task, tools) -> str. If seed is given the agent must
-           accept a `seed` keyword (used to tame stochastic agents).
+    agent: callable (task, tools) -> str, sync or async. If seed is given
+           the agent must accept a `seed` keyword (used to tame stochastic
+           agents).
+    tools: optional {name: callable} of custom tools (send_email, shell,
+           search, ...). They are recorded exactly like built-ins, appear
+           in traj.registered, and cannot shadow a built-in.
     """
     if max_steps < 1:
         raise ValueError("max_steps must be >= 1")
@@ -277,9 +445,12 @@ def run(
         )
     traj = Trajectory(max_steps=max_steps)
     traj.world = world
-    tools = _Tools(world, traj, max_steps)
+    handle = _Tools(world, traj, max_steps, tools)  # may raise: setup error
+    traj.registered = [n for n in _Tools.REGISTERED] + [
+        n for n in (tools or {}) if n not in _Tools.REGISTERED
+    ]
     try:
-        traj.final_answer = _call_agent(agent, task, tools, seed)
+        traj.final_answer = _call_agent(agent, task, handle, seed)
         traj.finished = True
     except MaxStepsExceeded as exc:
         traj.finished = False

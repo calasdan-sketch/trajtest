@@ -10,7 +10,7 @@ import posixpath
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from trajtest.errors import UnmockedRequestError
+from trajtest.errors import FSQuotaExceeded, UnmockedRequestError
 
 
 def _norm(path: str) -> str:
@@ -34,9 +34,23 @@ class FakeFS:
     unless created with mkdir(). Content may be str or bytes; read()
     returns whatever was written."""
 
-    def __init__(self):
+    #: default total content budget (characters for str, bytes for bytes)
+    DEFAULT_MAX_BYTES = 64 * 1024 * 1024
+
+    def __init__(self, max_bytes: int | None = DEFAULT_MAX_BYTES):
         self._files: dict[str, str | bytes] = {}
         self._dirs: set[str] = {"/"}
+        self.max_bytes = max_bytes  # None disables the quota
+        self._used = 0
+
+    def _charge(self, delta: int) -> None:
+        if self.max_bytes is not None and self._used + delta > self.max_bytes:
+            raise FSQuotaExceeded(
+                f"FakeFS quota exceeded: {self._used + delta} > {self.max_bytes} "
+                "bytes. A runaway agent can exhaust CI memory; raise "
+                "World(fs_max_bytes=...) if this is intended."
+            )
+        self._used += delta
 
     # -- mutation ------------------------------------------------------
     def write(self, path: str, content) -> None:
@@ -46,6 +60,7 @@ class FakeFS:
                 f"FakeFS.write content must be str or bytes, "
                 f"got {type(content).__name__}"
             )
+        self._charge(len(content) - len(self._files.get(path, "")))
         self._files[path] = content
         self._ensure_parents(path)
 
@@ -59,12 +74,14 @@ class FakeFS:
                 f"cannot append {type(content).__name__} to "
                 f"{type(existing).__name__} file"
             )
+        self._charge(len(content))
         self._files[path] = existing + content
 
     def delete(self, path: str) -> None:
         path = _norm(path)
         if path not in self._files:
             raise FileNotFoundError(f"No such file: {path}")
+        self._used -= len(self._files[path])
         del self._files[path]
 
     def mkdir(self, path: str) -> None:
@@ -130,22 +147,39 @@ class FakeFS:
     def reset(self) -> None:
         self._files.clear()
         self._dirs = {"/"}
+        self._used = 0
 
 
 def _segments_match(path_segs: list, pat_segs: list) -> bool:
-    """Segment-wise glob where '**' matches zero or more segments."""
-    if not pat_segs:
-        return not path_segs
-    if pat_segs[0] == "**":
-        return any(
-            _segments_match(path_segs[i:], pat_segs[1:])
-            for i in range(len(path_segs) + 1)
-        )
-    if not path_segs:
-        return False
-    if not fnmatch.fnmatchcase(path_segs[0], pat_segs[0]):
-        return False
-    return _segments_match(path_segs[1:], pat_segs[1:])
+    """Segment-wise glob where '**' matches zero or more segments.
+
+    Dynamic programming, O(len(path) * len(pattern)). The v0.1 recursive
+    version was exponential in the number of '**' segments, so an
+    agent-supplied pattern could hang an eval run.
+    """
+    # collapse consecutive '**' (they are equivalent to one)
+    pats: list = []
+    for seg in pat_segs:
+        if seg == "**" and pats and pats[-1] == "**":
+            continue
+        pats.append(seg)
+    n, m = len(path_segs), len(pats)
+    # reach[j] = pattern prefix pats[:j] can match path_segs[:i]
+    reach = [False] * (m + 1)
+    reach[0] = True
+    for j in range(1, m + 1):
+        reach[j] = reach[j - 1] and pats[j - 1] == "**"
+    for i in range(1, n + 1):
+        nxt = [False] * (m + 1)
+        for j in range(1, m + 1):
+            if pats[j - 1] == "**":
+                nxt[j] = nxt[j - 1] or reach[j]
+            else:
+                nxt[j] = reach[j - 1] and fnmatch.fnmatchcase(
+                    path_segs[i - 1], pats[j - 1]
+                )
+        reach = nxt
+    return reach[m]
 
 
 @dataclass
@@ -363,8 +397,10 @@ class Clock:
 class World:
     """The mock world an agent runs against: FS + HTTP + KV + clock."""
 
-    def __init__(self, strict_http: bool = True):
-        self.fs = FakeFS()
+    def __init__(
+        self, strict_http: bool = True, fs_max_bytes: int | None = FakeFS.DEFAULT_MAX_BYTES
+    ):
+        self.fs = FakeFS(max_bytes=fs_max_bytes)
         self.http = FakeHTTP(strict=strict_http)
         self.kv = KVStore()
         self.clock = Clock()

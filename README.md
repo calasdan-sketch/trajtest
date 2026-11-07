@@ -76,6 +76,12 @@ the agent *said* against what it *did*. Crashes become `traj.finished=False`
 with `traj.failure` set; exceeding `max_steps` is a trajectory failure, not
 a hang.
 
+**Custom tools, async agents.** `run(agent, task, world, tools={"send_email": fn})`
+records your own tools exactly like the built-ins (they cannot shadow a
+built-in). `flaky(fn, fail_times=2, error=TimeoutError("smtp"))` injects
+failures so you can prove retry logic. `async def` agents are driven to
+completion (tools stay synchronous; call them directly inside the coroutine).
+
 **sample(agent, task, world_factory, n=5)** — for stochastic agents: n runs
 against fresh worlds. Seeds are passed when the agent accepts a `seed`
 keyword. Assert consistency with a loop:
@@ -102,6 +108,14 @@ reports *every* failure at once (fail-collecting, not fail-fast):
 | `notes_contain / notes_match` | narration assertions |
 | `world_file(path, equals/contains/matches)` | final world state — the anti-lying assertion |
 | `world(desc, predicate)` / `custom(desc, fn)` | escape hatches |
+| `only_called(*names)` | tool allowlist |
+| `fs_writes_confined_to(*globs)` | every write/append/delete stays inside these paths (fails closed) |
+| `http_confined_to(*patterns)` | egress allowlist; rejects `user@host` authority spoofs |
+| `always_preceded_by(target, prereq, on=("path",))` | e.g. never delete what you did not read first |
+| `no_repeated_calls(max_identical=2)` / `no_tool_errors()` | loop detector / error-free run |
+
+`never_called("fs_delet")` (a typo) **fails** with a did-you-mean instead of
+passing forever.
 
 Kwarg matching uses **parameter names**, so `called("http_get",
 url__contains="api.example.com")` works whether the agent passed the URL
@@ -113,6 +127,84 @@ __startswith __endswith __gt __lt __ge __le`. Matchers (`ANY`, `Contains`,
 **pytest plugin** — a `world` fixture (fresh `World` per test) is
 auto-registered. **CLI** — `trajtest init` scaffolds an example eval;
 `trajtest run <path>` runs evals through pytest.
+
+## Assert on real runs, not just mocks (v0.2)
+
+Record a production or staging trace (OpenAI-style or Anthropic-style
+messages, or `traj.save("golden.json")`) and run the same call-based
+assertions on it, no mock world needed:
+
+```python
+from trajtest import Expect, Trajectory
+traj = Trajectory.from_openai_messages(messages, tools=["fs_read", "fs_delete"])
+Expect(traj).notes_contain("only read").never_called("fs_delete").assert_all()
+```
+
+Assistant text that accompanies tool calls becomes a *note*, so "said it
+would only read, then deleted" is catchable on real transcripts. In CI, no
+Python needed:
+
+```bash
+trajtest audit traces/*.json --allow-tools fs_read,http_get \
+    --http-allow 'https://api.example.com/*' --fs-write-allow '/out/**' \
+    --max-repeats 3 --must-precede fs_delete:fs_read:path
+# exit 0 clean, 1 violation, 2 bad input or no rules (never passes vacuously)
+```
+
+Imported traces carry no world, so `world_file()` / `world()` refuse to run
+on them (they raise, they do not guess).
+
+**Pass rates for stochastic agents:** `assert_pass_rate(sample(...), lambda t:
+Expect(t).never_called("fs_delete"), min_rate=1.0)` lists failing runs; the
+default demands every run pass.
+
+## Safe to run in CI
+
+Agent text is untrusted. Everything trajtest prints is escaped (ANSI,
+newlines, bidi and zero-width characters can't forge report lines) and
+credentials are masked: values under keys like `Authorization`, `api_key`,
+`token`, `password`, `Bearer ...` strings, and common token shapes (`sk-...`,
+`ghp_...`, `AKIA...`, `xox*-`, JWTs). The raw values stay available to your
+assertions. The mock FS has a 64 MiB quota (`World(fs_max_bytes=...)`) so a
+runaway agent can't exhaust CI memory; `fs_glob` is linear-time.
+
+## How it compares
+
+Measured on one Linux box, Python 3.13, fresh venvs, `pip install` of the
+latest release on 2026-11-07 (pip package counts include pip itself):
+
+| | trajtest 0.2.0 | agentevals 0.0.9 | deepeval 4.3.3 | inspect-ai 0.3.288 | promptfoo 0.125.1 |
+|---|---|---|---|---|---|
+| Packages installed | 7 | 51 | 67 | 81 | n/a (npm: 413 top-level dirs) |
+| Disk (site-packages / node_modules) | 21 MB | 99 MB | 118 MB | 248 MB | 734 MB |
+| `import` time | 0.07 s | not measured | 2.7 s | 3.1 s | n/a |
+| Needs an LLM/API key for its trajectory checks | no (no LLM anywhere) | match modes: no; LLM-judge evaluators exist (`llm.py`) | several metrics are LLM-judged (unverified which) | scorers can be model-graded (unverified per scorer) | unverified |
+| Mock world (FS/HTTP) to assert side effects | **yes** | no, compares message trajectories against a reference | no (unverified) | sandboxes exist, unverified | no (unverified) |
+| Needs a reference trajectory | no | yes (`reference_outputs`) | unverified | n/a | unverified |
+| Runs on recorded OpenAI/Anthropic traces | **yes** | OpenAI-style / LangChain messages | unverified | unverified | unverified |
+| Allowlist / egress / read-before-delete checks | **yes** | no | `ToolPermissionMetric` exists (class verified, semantics unverified) | unverified | unverified |
+
+Sources: https://pypi.org/project/agentevals/ and
+https://github.com/langchain-ai/agentevals (installed; API read from the
+package), https://pypi.org/project/deepeval/ (installed; metric class names
+read from the package), https://pypi.org/project/inspect-ai/ and
+https://inspect.aisi.org.uk, https://www.promptfoo.dev (installed via npm,
+features not tested hands-on). LangSmith evals
+(https://docs.smith.langchain.com) is hosted and needs an account; **not
+evaluated, unverified**. "Unverified" means we did not test it; check their
+docs. Those tools do things trajtest deliberately does not (LLM judges,
+datasets, dashboards, red-teaming); they solve a different problem and
+combine with trajtest well.
+
+### Benchmarks you can re-run
+
+`python bench/bench.py` (median of 5; same machine, v0.1.1 vs v0.2.0):
+
+| | v0.1.1 | v0.2.0 |
+|---|---|---|
+| tool-call overhead | 17.9 us/call | 5.5 us/call |
+| `fs_glob` with six `**` segments, 30-deep tree | 790 ms (exponential) | < 0.1 ms |
+| glob over 3000 files | 5.6 ms | 7.1 ms (same; noise-level) |
 
 ## Limitations (honest)
 
@@ -127,10 +219,21 @@ auto-registered. **CLI** — `trajtest init` scaffolds an example eval;
   Use `sample()`, seeds, and order-flexible assertions. If your agent is
   wildly non-deterministic, trajectory evals will be brittle — that's a
   signal about the agent, not just the eval.
-- **Single-threaded.** Agents that spawn threads or subprocesses calling
-  tools concurrently are not supported.
-- **No framework adapters in v1.** The agent is `(task, tools) -> str`;
-  wrapping a LangChain/CrewAI loop takes ~5 lines on your side.
+- **Threads are safe, subprocesses are not.** Tool calls from threads get
+  unique step numbers and respect `max_steps`; subprocesses can't see the
+  mock world. Async tools (`await tools.x()`) are not supported: tools are
+  synchronous.
+- **Redaction is best-effort.** It masks secret-looking keys and common
+  token shapes; a custom secret passed positionally with no recognisable
+  shape (`kv_set("k", "hunter2")`) is printed. Don't put real secrets in
+  evals.
+- **Imported traces have no world and no timing**, and OpenAI/Anthropic
+  formats don't mark tool failures (Anthropic `is_error` is honoured).
+- Tested on Python 3.13 locally; 3.10 is the declared floor and is
+  exercised only by the CI workflow (unverified until it runs).
+- **No framework adapters.** The agent is `(task, tools) -> str`;
+  wrapping a LangChain/CrewAI loop takes ~5 lines on your side (or record
+  its messages and use `from_openai_messages`).
 - **No LLM-as-judge**, by design. Semantic judgments belong in a custom
   `predicate`, not in the core.
 

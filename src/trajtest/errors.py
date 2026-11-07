@@ -19,3 +19,7 @@ class MaxStepsExceeded(Exception):
 
 class UnmockedRequestError(Exception):
     """Raised by FakeHTTP when no mock matches a request (strict mode)."""
+
+
+class FSQuotaExceeded(OSError):
+    """Raised by FakeFS when total content would exceed the world's quota."""

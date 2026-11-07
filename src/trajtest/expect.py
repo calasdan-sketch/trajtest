@@ -14,10 +14,15 @@ assert_all() reports EVERYTHING that failed — plus a trajectory transcript —
 in a single EvalFailure. check() returns the violations without raising.
 """
 
+import difflib
+import fnmatch
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from trajtest import matchers as m
 from trajtest.errors import EvalFailure
+from trajtest.sanitize import clean
+from trajtest.world import _norm, _segments_match
 
 _MISSING = object()
 
@@ -30,9 +35,9 @@ class Violation:
 
     def line(self) -> str:
         mark = "✓" if self.ok else "✗"
-        text = f"  {mark} {self.description}"
+        text = f"  {mark} {clean(self.description)}"
         if not self.ok and self.detail:
-            text += f"\n      {self.detail}"
+            text += f"\n      {clean(self.detail)}"
         return text
 
 
@@ -57,6 +62,26 @@ def call_matches(call, args, kwargs) -> bool:
         if actual is _MISSING or not matcher.matches(actual):
             return False
     return True
+
+
+_FS_MUTATORS = ("fs_write", "fs_append", "fs_delete")
+_MISSING_ARG = object()
+
+
+def _arg(call, name: str, pos: int):
+    """A call's argument by parameter name, falling back to position."""
+    bound = call.bound or {}
+    if name in bound:
+        return bound[name]
+    if name in call.kwargs:
+        return call.kwargs[name]
+    if pos < len(call.args):
+        return call.args[pos]
+    return _MISSING_ARG
+
+
+def _url_pos(call) -> int:
+    return 1 if call.name == "http_request" else 0
 
 
 def _fmt_call_args(call) -> str:
@@ -115,7 +140,24 @@ class Expect:
     # alias: reads better in some evals
     called_with = called
 
+    def _unknown_name(self, desc: str, name: str) -> "Expect | None":
+        """Fail closed on a tool name that never existed in this run.
+
+        `never_called("fs_delet")` would otherwise pass forever on a typo.
+        Skipped for imported traces with no known tool list.
+        """
+        reg = self.traj.registered
+        if reg is None or name in reg or name in self.traj.tool_names:
+            return None
+        close = difflib.get_close_matches(name, reg, n=1)
+        hint = f" (did you mean {close[0]!r}?)" if close else ""
+        return self._record(
+            False, desc, f"unknown tool {name!r}: no such tool in this run{hint}"
+        )
+
     def called_times(self, name: str, n: int) -> "Expect":
+        if n == 0 and (bad := self._unknown_name(f'called_times("{name}", 0)', name)):
+            return bad
         count = len(self.traj.calls_to(name))
         return self._record(
             count == n,
@@ -132,6 +174,8 @@ class Expect:
         )
 
     def at_most(self, n: int, name: str) -> "Expect":
+        if bad := self._unknown_name(f'at_most({n}, "{name}")', name):
+            return bad
         count = len(self.traj.calls_to(name))
         return self._record(
             count <= n, f'at_most({n}, "{name}")', f"found {count}" if count > n else ""
@@ -139,8 +183,10 @@ class Expect:
 
     def never_called(self, name: str, *args, **kwargs) -> "Expect":
         """Forbid calls to `name` — optionally only those matching args."""
-        hits = self._matching(name, args, kwargs)
         desc = f'never_called("{name}"{self._fmt_expect(args, kwargs)})'
+        if bad := self._unknown_name(desc, name):
+            return bad
+        hits = self._matching(name, args, kwargs)
         if not hits:
             return self._record(True, desc)
         shown = "; ".join(f"#{c.step} {c.name}({_fmt_call_args(c)})" for c in hits[:3])
@@ -337,6 +383,121 @@ class Expect:
         """Escape hatch: fn(trajectory) -> bool, or (bool, message)."""
         ok, msg = self._coerce_result(fn(self.traj))
         return self._record(ok, f"custom({description})", msg if not ok else "")
+
+    # -- safety scope (allowlists) --------------------------------------
+    def only_called(self, *names: str) -> "Expect":
+        """Tool allowlist: every call must be to one of `names`."""
+        desc = f"only_called({', '.join(repr(n) for n in names)})"
+        bad = [c for c in self.traj.calls if c.name not in names]
+        if not bad:
+            return self._record(True, desc)
+        shown = "; ".join(c.short() for c in bad[:3])
+        return self._record(False, desc, f"{len(bad)} call(s) outside allowlist: {shown}")
+
+    def fs_writes_confined_to(self, *globs: str) -> "Expect":
+        """Every fs_write/fs_append/fs_delete must target a path matching
+        one of the absolute `globs` (supports ``*`` and ``**``).
+
+        Fails closed: a mutation whose path is missing, relative, or not
+        resolvable is a violation, not a pass. Works on imported traces too.
+        """
+        desc = f"fs_writes_confined_to({', '.join(repr(g) for g in globs)})"
+        if not globs:
+            raise ValueError("fs_writes_confined_to needs at least one glob")
+        pats = [[s for s in _norm(g).split("/") if s] for g in globs]
+        bad = []
+        for c in self.traj.calls:
+            if c.name not in _FS_MUTATORS:
+                continue
+            raw = _arg(c, "path", 0)
+            try:
+                if raw is _MISSING_ARG:
+                    raise ValueError("no path argument")
+                segs = [x for x in _norm(raw).split("/") if x]
+            except (ValueError, TypeError):
+                bad.append(f"{c.short()} (path unresolvable)")
+                continue
+            if not any(_segments_match(segs, p) for p in pats):
+                bad.append(c.short())
+        if not bad:
+            return self._record(True, desc)
+        return self._record(False, desc, f"{len(bad)} write(s) outside scope: " + "; ".join(bad[:3]))
+
+    def http_confined_to(self, *patterns: str) -> "Expect":
+        """Egress allowlist: every http_* call's URL must match one of the
+        fnmatch `patterns` (e.g. ``https://api.example.com/*``).
+
+        Fails closed on a missing URL, control characters, or URLs with
+        embedded credentials / ``@`` in the authority (a classic host-spoof).
+        """
+        desc = f"http_confined_to({', '.join(repr(p) for p in patterns)})"
+        if not patterns:
+            raise ValueError("http_confined_to needs at least one pattern")
+        bad = []
+        for c in self.traj.calls:
+            if not c.name.startswith("http_"):
+                continue
+            url = _arg(c, "url", _url_pos(c))
+            if not isinstance(url, str) or any(ord(ch) < 32 for ch in url):
+                bad.append(f"{c.short()} (url unresolvable)")
+                continue
+            try:
+                spoof = "@" in urlsplit(url).netloc
+            except ValueError:
+                spoof = True
+            if spoof or not any(fnmatch.fnmatchcase(url, p) for p in patterns):
+                bad.append(c.short())
+        if not bad:
+            return self._record(True, desc)
+        return self._record(False, desc, f"{len(bad)} request(s) outside egress allowlist: " + "; ".join(bad[:3]))
+
+    def always_preceded_by(self, target: str, prerequisite: str, on=("path",)) -> "Expect":
+        """Every `target` call needs an earlier, *successful* `prerequisite`
+        call with equal values for each parameter in `on`.
+
+        Example: ``always_preceded_by("fs_delete", "fs_read", on=("path",))``
+        = never delete a file you did not read first.
+        """
+        on = (on,) if isinstance(on, str) else tuple(on)
+        desc = f'always_preceded_by("{target}", "{prerequisite}", on={on})'
+        bad = []
+        calls = self.traj.calls
+        for i, c in enumerate(calls):
+            if c.name != target:
+                continue
+            want = [_arg(c, k, 0) for k in on]
+            ok = any(
+                p.name == prerequisite
+                and p.error is None
+                and [_arg(p, k, 0) for k in on] == want
+                for p in calls[:i]
+            )
+            if not ok:
+                bad.append(c.short())
+        if not bad:
+            return self._record(True, desc)
+        return self._record(False, desc, f"{len(bad)} call(s) without prerequisite: " + "; ".join(bad[:3]))
+
+    def no_repeated_calls(self, max_identical: int = 2) -> "Expect":
+        """Loop detector: no (tool, args) combination may occur more than
+        `max_identical` times."""
+        desc = f"no_repeated_calls(max_identical={max_identical})"
+        seen: dict = {}
+        for c in self.traj.calls:
+            key = (c.name, repr(c.args), repr(sorted(c.kwargs.items(), key=lambda kv: kv[0])))
+            seen.setdefault(key, []).append(c)
+        bad = [v for v in seen.values() if len(v) > max_identical]
+        if not bad:
+            return self._record(True, desc)
+        worst = max(bad, key=len)
+        return self._record(False, desc, f"{worst[0].short()} repeated {len(worst)}x")
+
+    def no_tool_errors(self) -> "Expect":
+        """No tool call raised (use after retries are expected to succeed)."""
+        errs = [c for c in self.traj.calls if c.error]
+        if not errs:
+            return self._record(True, "no_tool_errors()")
+        return self._record(False, "no_tool_errors()", f"{len(errs)} failed call(s): " + "; ".join(c.short() for c in errs[:3]))
 
     # -- verdict ---------------------------------------------------------
     def check(self) -> list[Violation]:
