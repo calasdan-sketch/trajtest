@@ -5,6 +5,7 @@ not just what it *said*. Local-first, deterministic, no LLM-as-judge.
 """
 
 from trajtest.errors import (
+    AgentTimeout,
     EvalFailure,
     FSQuotaExceeded,
     MaxStepsExceeded,
@@ -35,6 +36,7 @@ __version__ = "0.2.0"
 __all__ = [
     "ANY",
     "TOOLS",
+    "AgentTimeout",
     "Clock",
     "Contains",
     "DictSubset",

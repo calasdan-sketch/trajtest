@@ -158,6 +158,41 @@ on them (they raise, they do not guess).
 Expect(t).never_called("fs_delete"), min_rate=1.0)` lists failing runs; the
 default demands every run pass.
 
+## Safety assertions for security reviewers (round 3)
+
+```python
+Expect(traj)
+    .http_hosts_confined_to("api.example.com", "*.example.com")  # parsed host, https only
+    .no_data_leak(planted_secret)        # raw, URL-encoded or base64 in any HTTP arg
+    .no_secret_shapes()                  # sk-..., ghp_..., ?api_key=..., PEM, Bearer ...
+    .retried_after_error("send_email")   # failed once, later succeeded
+    .same_tools_as(golden, args=False)   # regression vs a saved golden trace
+    .assert_all()
+```
+
+- `http_hosts_confined_to` compares the URL's real hostname (case-folded,
+  port and trailing dot ignored). Rejects userinfo, backslashes, control
+  characters, non-ASCII hosts, `http://` and unlisted IPs. Hosts with
+  underscores are rejected too (fail closed).
+- `no_data_leak` values must be at least 4 characters; the report never
+  prints them (known secrets are masked in the whole failure output). It
+  searches call arguments only, not results, and only the encodings above.
+- `never_called("fs_delete", path="/data/x")` now also matches
+  `/data/./x`, `//data/x` and `/tmp/../data/x` (the mock FS resolves them
+  to the same file; before, they slipped past).
+- `fs_writes_confined_to` checks every copy of the path in a trace and fails
+  closed on backslashes, NUL and `%2e/%2f` (ambiguous across OSes).
+- `run(agent, task, world, timeout=10)` stops a hung agent: the trajectory is
+  frozen with `failure="AgentTimeout..."`. A Python thread cannot be killed,
+  so a tool-free infinite loop keeps running in the background.
+
+CLI additions: `trajtest audit --policy policy.json --json` (a reviewable
+JSON policy; unknown keys are an error so a typo can't drop a rule; the
+report includes each trace's SHA-256), `--http-host-allow`,
+`--no-secret-shapes`, and `trajtest diff golden.json new.json [--args]`.
+`python -m trajtest` works. `traj.save()` now masks secrets by default
+(`redact=False` to keep raw values) and writes atomically.
+
 ## Safe to run in CI
 
 Agent text is untrusted. Everything trajtest prints is escaped (ANSI,
@@ -165,7 +200,7 @@ newlines, bidi and zero-width characters can't forge report lines) and
 credentials are masked: values under keys like `Authorization`, `api_key`,
 `token`, `password`, `Bearer ...` strings, and common token shapes (`sk-...`,
 `ghp_...`, `AKIA...`, `xox*-`, JWTs). The raw values stay available to your
-assertions. The mock FS has a 64 MiB quota (`World(fs_max_bytes=...)`) so a
+assertions. Output is bounded before it is scanned (an 8 MB value prints in ~0.2 s, was ~13 s). URL query secrets (`?api_key=`), `user:pass@` URLs, PEM private keys and `sk_live_`/`github_pat_`/`AIza` shapes are masked. The mock FS has a 64 MiB quota counted in UTF-8 bytes (`World(fs_max_bytes=...)`) so a
 runaway agent can't exhaust CI memory; `fs_glob` is linear-time.
 
 ## How it compares
@@ -182,7 +217,7 @@ latest release on 2026-11-07 (pip package counts include pip itself):
 | Mock world (FS/HTTP) to assert side effects | **yes** | no, compares message trajectories against a reference | no (unverified) | sandboxes exist, unverified | no (unverified) |
 | Needs a reference trajectory | no | yes (`reference_outputs`) | unverified | n/a | unverified |
 | Runs on recorded OpenAI/Anthropic traces | **yes** | OpenAI-style / LangChain messages | unverified | unverified | unverified |
-| Allowlist / egress / read-before-delete checks | **yes** | no | `ToolPermissionMetric` exists (class verified, semantics unverified) | unverified | unverified |
+| Allowlist / egress / read-before-delete / leak checks | **yes** | no | `ToolPermissionMetric` exists (class verified, semantics unverified) | unverified | unverified |
 
 Sources: https://pypi.org/project/agentevals/ and
 https://github.com/langchain-ai/agentevals (installed; API read from the
@@ -194,17 +229,27 @@ features not tested hands-on). LangSmith evals
 evaluated, unverified**. "Unverified" means we did not test it; check their
 docs. Those tools do things trajtest deliberately does not (LLM judges,
 datasets, dashboards, red-teaming); they solve a different problem and
-combine with trajtest well.
+combine with trajtest well. agentevals (read from the installed 0.0.9 package) offers strict / unordered / subset / superset trajectory match modes against a reference; trajtest's `same_tools_as` covers the strict and unordered cases only (no subset/superset).
 
 ### Benchmarks you can re-run
 
-`python bench/bench.py` (median of 5; same machine, v0.1.1 vs v0.2.0):
+`python bench/bench.py` (median of 3-5; this box is noisy, so compare on one machine; v0.2.0 as first released vs this branch, 2026-11-07):
 
 | | v0.1.1 | v0.2.0 |
 |---|---|---|
 | tool-call overhead | 17.9 us/call | 5.5 us/call |
 | `fs_glob` with six `**` segments, 30-deep tree | 790 ms (exponential) | < 0.1 ms |
 | glob over 3000 files | 5.6 ms | 7.1 ms (same; noise-level) |
+
+| Round 3, same box, interleaved runs | v0.2.0 | this branch |
+|---|---|---|
+| tool-call overhead | 16-26 us | 23-28 us (new lock + cancel check, roughly +3 us) |
+| print the report of a run with an 8 MB value | 13,100 ms | 190 ms |
+| `always_preceded_by` over 8k calls | 7,170 ms (quadratic) | 15 ms (40k calls: 83 ms) |
+| `redact` of 300 KB hostile text | 300 ms | 270-350 ms (unchanged) |
+
+(The 5.5 us overhead above was measured on a faster moment/machine; absolute
+microseconds are not comparable across runs.)
 
 ## Limitations (honest)
 
@@ -220,7 +265,7 @@ combine with trajtest well.
   wildly non-deterministic, trajectory evals will be brittle — that's a
   signal about the agent, not just the eval.
 - **Threads are safe, subprocesses are not.** Tool calls from threads get
-  unique step numbers and respect `max_steps`; subprocesses can't see the
+  unique step numbers and respect `max_steps`; the mock FS/HTTP/KV are lock-protected; subprocesses can't see the
   mock world. Async tools (`await tools.x()`) are not supported: tools are
   synchronous.
 - **Redaction is best-effort.** It masks secret-looking keys and common
@@ -229,6 +274,8 @@ combine with trajtest well.
   evals.
 - **Imported traces have no world and no timing**, and OpenAI/Anthropic
   formats don't mark tool failures (Anthropic `is_error` is honoured).
+- **Not covered:** percent-decoded or Unicode-confusable *paths* beyond the ambiguity rejection above; encodings other than raw/URL/base64 in `no_data_leak`; HTTP 4xx/5xx *responses* count as errors only if the tool raised (`retried_after_error`); case-insensitive filesystems (`/ETC` vs `/etc`).
+- `no_secret_shapes` and redaction key off key names containing `token`, `secret`, `password`, `api_key`...; a benign key like `tokenizer` is a false positive.
 - Tested on Python 3.13 locally; 3.10 is the declared floor and is
   exercised only by the CI workflow (unverified until it runs).
 - **No framework adapters.** The agent is `(task, tools) -> str`;

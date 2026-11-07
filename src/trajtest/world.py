@@ -6,17 +6,35 @@ produces agents that pass evals and fail in production.
 """
 
 import fnmatch
+import functools
 import posixpath
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from trajtest.errors import FSQuotaExceeded, UnmockedRequestError
 
 
+def _locked(fn):
+    """Serialise a method on the instance's RLock (agents may use threads)."""
+
+    @functools.wraps(fn)
+    def wrapper(self, *a, **k):
+        with self._lock:
+            return fn(self, *a, **k)
+
+    return wrapper
+
+
 def _norm(path: str) -> str:
     """Normalize to an absolute posix path. `..` cannot escape root."""
     if not isinstance(path, str) or not path.startswith("/"):
-        raise ValueError(f"trajtest FakeFS paths must be absolute, got {path!r}")
+        hint = ""
+        if isinstance(path, str) and (path[1:3] in (":\\", ":/") or path.startswith("\\")):
+            hint = " (Windows-style path: the mock FS is posix; use e.g. '/c/out/x')"
+        raise ValueError(f"trajtest FakeFS paths must be absolute, got {path!r}{hint}")
+    if "\x00" in path:
+        raise ValueError("trajtest FakeFS paths must not contain NUL")
     parts = []
     for part in posixpath.normpath(path).split("/"):
         if part in ("", "."):
@@ -27,6 +45,14 @@ def _norm(path: str) -> str:
             continue
         parts.append(part)
     return "/" + "/".join(parts)
+
+
+def _size(content) -> int:
+    """Quota size: bytes for bytes, UTF-8 bytes for str (len() undercounts
+    non-ASCII up to 4x, so a 64 MiB quota could really hold 256 MiB)."""
+    if isinstance(content, str):
+        return len(content) if content.isascii() else len(content.encode("utf-8", "surrogatepass"))
+    return len(content)
 
 
 class FakeFS:
@@ -42,6 +68,7 @@ class FakeFS:
         self._dirs: set[str] = {"/"}
         self.max_bytes = max_bytes  # None disables the quota
         self._used = 0
+        self._lock = threading.RLock()
 
     def _charge(self, delta: int) -> None:
         if self.max_bytes is not None and self._used + delta > self.max_bytes:
@@ -53,6 +80,7 @@ class FakeFS:
         self._used += delta
 
     # -- mutation ------------------------------------------------------
+    @_locked
     def write(self, path: str, content) -> None:
         path = _norm(path)
         if not isinstance(content, (str, bytes)):
@@ -60,10 +88,11 @@ class FakeFS:
                 f"FakeFS.write content must be str or bytes, "
                 f"got {type(content).__name__}"
             )
-        self._charge(len(content) - len(self._files.get(path, "")))
+        self._charge(_size(content) - _size(self._files.get(path, "")))
         self._files[path] = content
         self._ensure_parents(path)
 
+    @_locked
     def append(self, path: str, content) -> None:
         path = _norm(path)
         if path not in self._files:
@@ -74,16 +103,18 @@ class FakeFS:
                 f"cannot append {type(content).__name__} to "
                 f"{type(existing).__name__} file"
             )
-        self._charge(len(content))
+        self._charge(_size(content))
         self._files[path] = existing + content
 
+    @_locked
     def delete(self, path: str) -> None:
         path = _norm(path)
         if path not in self._files:
             raise FileNotFoundError(f"No such file: {path}")
-        self._used -= len(self._files[path])
+        self._used -= _size(self._files[path])
         del self._files[path]
 
+    @_locked
     def mkdir(self, path: str) -> None:
         path = _norm(path)
         self._dirs.add(path)
@@ -96,6 +127,7 @@ class FakeFS:
             parent = posixpath.dirname(parent)
 
     # -- inspection ----------------------------------------------------
+    @_locked
     def read(self, path: str):
         """Return file content as written (str or bytes)."""
         path = _norm(path)
@@ -103,17 +135,21 @@ class FakeFS:
             raise FileNotFoundError(f"No such file: {path}")
         return self._files[path]
 
+    @_locked
     def exists(self, path: str) -> bool:
         path = _norm(path)
         return path in self._files or path in self._dirs
 
+    @_locked
     def is_file(self, path: str) -> bool:
         return _norm(path) in self._files
 
+    @_locked
     def is_dir(self, path: str) -> bool:
         path = _norm(path)
         return path in self._dirs and path not in self._files
 
+    @_locked
     def listdir(self, path: str) -> list:
         """Immediate child names (files and dirs) of a directory."""
         path = _norm(path)
@@ -130,6 +166,7 @@ class FakeFS:
                     children.add(rest.split("/")[0])
         return sorted(children)
 
+    @_locked
     def glob(self, pattern: str) -> list:
         """Glob over file paths. Pattern must be absolute, e.g. '/docs/*.md'.
 
@@ -144,6 +181,7 @@ class FakeFS:
                 matches.append(path)
         return sorted(matches)
 
+    @_locked
     def reset(self) -> None:
         self._files.clear()
         self._dirs = {"/"}
@@ -241,7 +279,9 @@ class FakeHTTP:
         self.strict = strict
         self._routes: list[_MockRoute] = []
         self.requests: list[LoggedRequest] = []
+        self._lock = threading.RLock()
 
+    @_locked
     def mock(
         self,
         method: str,
@@ -306,6 +346,7 @@ class FakeHTTP:
             return self._routes[candidates[-1]]  # queue exhausted: repeat last
         return None
 
+    @_locked
     def request(self, method: str, url: str, **kwargs) -> FakeResponse:
         self.requests.append(LoggedRequest(method.upper(), url, kwargs))
         route = self._find(method, url)
@@ -345,6 +386,7 @@ class FakeHTTP:
     def delete(self, url: str, **kwargs) -> FakeResponse:
         return self.request("DELETE", url, **kwargs)
 
+    @_locked
     def reset(self) -> None:
         self._routes.clear()
         self.requests.clear()
@@ -355,7 +397,9 @@ class KVStore:
 
     def __init__(self):
         self._data: dict = {}
+        self._lock = threading.RLock()
 
+    @_locked
     def get(self, key, default=...):
         if key in self._data:
             return self._data[key]
@@ -363,17 +407,21 @@ class KVStore:
             raise KeyError(key)
         return default
 
+    @_locked
     def set(self, key, value) -> None:
         self._data[key] = value
 
+    @_locked
     def delete(self, key) -> None:
         if key not in self._data:
             raise KeyError(key)
         del self._data[key]
 
+    @_locked
     def exists(self, key) -> bool:
         return key in self._data
 
+    @_locked
     def clear(self) -> None:
         self._data.clear()
 

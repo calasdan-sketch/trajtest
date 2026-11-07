@@ -30,5 +30,32 @@ Expert-review release. Backward compatible except where noted.
   thread-safe step numbering.
 - `bench/bench.py`, CI workflow, 50 new tests (135 -> 185).
 
+### Round 3 (still the unreleased 0.2.0 line; no version bump)
+Found by hands-on attacks (security red team, performance, trace-fuzz,
+auditor, DX, competitor engineer), then re-attacked on the new code.
+- **Security bug**: `never_called("fs_delete", path="/data/x")` was bypassed by
+  `/data/./x`, `//data/x`, `/tmp/../data/x`; the file really was deleted.
+  Path args now match raw OR normalised.
+- **Security bug**: `fs_writes_confined_to` accepted `/out/..\\..\\etc` (escapes on
+  Windows); and imported traces whose `bound` disagreed with `args` could hide a
+  path/URL. Now fail closed on backslash/NUL/`%2e`, and every copy of the
+  argument must pass. Behaviour change: such paths now fail the assertion.
+- Trace loader: 9 shapes raised TypeError/AttributeError/RecursionError instead
+  of ValueError (audit CLI crashed on a deeply nested file). Fuzzed 3000 random
+  documents; only ValueError now.
+- Output: printing a 20 MB value took 15 s (redaction ran before truncation) and
+  `world_file` failures dumped the whole file; both bounded. Redaction now also
+  masks URL query secrets, `user:pass@` URLs, PEM keys, `sk_live_`, `github_pat_`,
+  `AIza`, `npm_` shapes.
+- `always_preceded_by` was quadratic (7 s for 8k calls); now linear.
+- Mock FS quota counts UTF-8 bytes (was characters); FS/HTTP/KV are lock-protected.
+- Added: `http_hosts_confined_to`, `no_data_leak`, `no_secret_shapes`,
+  `retried_after_error`, `same_tools_as` / `golden_diff`, `run/sample(timeout=)`,
+  `AgentTimeout`, `trajtest diff`, `trajtest audit --policy/--json/--http-host-allow/--no-secret-shapes`,
+  `python -m trajtest`, `py.typed`, did-you-mean on mistyped tool names,
+  Windows-path hint. Behaviour change: `Trajectory.save()` redacts by default
+  and writes atomically (`redact=False` for raw).
+- Tests 185 -> 244.
+
 ### Performance
 - Tool-call overhead 17.9 -> 5.5 us (signature inspection cached).

@@ -1,6 +1,8 @@
 """trajtest CLI: scaffold evals and run them."""
 
 import argparse
+import hashlib
+import json
 import sys
 
 from trajtest import __version__
@@ -109,51 +111,135 @@ def cmd_run(args) -> int:
     return code
 
 
+_POLICY_KEYS = {
+    "allow_tools": list, "http_allow": list, "http_host_allow": list,
+    "fs_write_allow": list, "max_repeats": int, "no_tool_errors": bool,
+    "no_secret_shapes": bool, "must_precede": list, "tools": list,
+}
+
+
+def _load_policy(path) -> dict:
+    """A reviewable JSON policy file (same rules as the flags). Unknown keys
+    or wrong types are errors: a typo must not silently drop a rule."""
+    from trajtest import traces
+
+    data = traces.load_json_file(path)
+    if not isinstance(data, dict):
+        raise ValueError("policy must be a JSON object")
+    for k, v in data.items():
+        if k not in _POLICY_KEYS:
+            raise ValueError(f"unknown policy key {k!r}")
+        want = _POLICY_KEYS[k]
+        if not isinstance(v, want) or (want is int and isinstance(v, bool)):
+            raise ValueError(f"policy key {k!r} must be {want.__name__}")
+        if want is list and not all(isinstance(x, str) for x in v):
+            raise ValueError(f"policy key {k!r} must be a list of strings")
+    return data
+
+
 def cmd_audit(args) -> int:
     """Check recorded traces against safety rules. Exit 0 clean, 1 violation,
-    2 bad input / no rules (a rule-free audit would pass vacuously)."""
-    from trajtest import Expect, traces
+    2 bad input / no rules (a rule-free audit would pass vacuously).
 
-    rules = [
-        args.allow_tools, args.http_allow, args.fs_write_allow,
-        args.max_repeats is not None, args.no_tool_errors, args.must_precede,
-    ]
-    if not any(rules):
-        print("trajtest audit: no rules given; refusing to pass vacuously", file=sys.stderr)
+    --json prints one machine-readable report (trace SHA-256, rules, results)
+    for CI artifacts and reviewers. All untrusted text is escaped.
+    """
+    from trajtest import Expect, traces
+    from trajtest.sanitize import clean
+
+    def err(msg):
+        print(clean(msg), file=sys.stderr)
+
+    pol = {}
+    if args.policy:
+        try:
+            pol = _load_policy(args.policy)
+        except (OSError, ValueError) as exc:
+            err(f"{args.policy}: bad policy: {exc}")
+            return 2
+    allow_raw = (args.allow_tools or []) + pol.get("allow_tools", [])
+    http_allow = (args.http_allow or []) + pol.get("http_allow", [])
+    host_allow = (args.http_host_allow or []) + pol.get("http_host_allow", [])
+    fs_allow = (args.fs_write_allow or []) + pol.get("fs_write_allow", [])
+    max_rep = args.max_repeats if args.max_repeats is not None else pol.get("max_repeats")
+    no_err = args.no_tool_errors or pol.get("no_tool_errors", False)
+    shapes = args.no_secret_shapes or pol.get("no_secret_shapes", False)
+    must = (args.must_precede or []) + pol.get("must_precede", [])
+    tool_list = (args.tool or []) + pol.get("tools", [])
+    if not any([allow_raw, http_allow, host_allow, fs_allow, max_rep is not None, no_err, shapes, must]):
+        err("trajtest audit: no rules given; refusing to pass vacuously")
         return 2
-    allow = [t for chunk in (args.allow_tools or []) for t in chunk.split(",") if t]
-    worst = 0
+    allow = [t for chunk in allow_raw for t in chunk.split(",") if t]
+    report, worst = [], 0
     for path in args.traces:
         try:
+            with open(path, "rb") as fh:
+                digest = hashlib.sha256(fh.read(traces.MAX_FILE_BYTES + 1)).hexdigest()
             data = traces.load_json_file(path)
-            traj = traces.detect_and_load(data, tools=args.tool or None)
+            traj = traces.detect_and_load(data, tools=tool_list or None)
         except (OSError, ValueError) as exc:
-            print(f"{path}: cannot read trace: {exc}", file=sys.stderr)
+            err(f"{path}: cannot read trace: {exc}")
             return 2
         exp = Expect(traj)
         if allow:
             exp.only_called(*allow)
-        if args.http_allow:
-            exp.http_confined_to(*args.http_allow)
-        if args.fs_write_allow:
-            exp.fs_writes_confined_to(*args.fs_write_allow)
-        if args.max_repeats is not None:
-            exp.no_repeated_calls(args.max_repeats)
-        if args.no_tool_errors:
+        if http_allow:
+            exp.http_confined_to(*http_allow)
+        if host_allow:
+            exp.http_hosts_confined_to(*host_allow)
+        if fs_allow:
+            exp.fs_writes_confined_to(*fs_allow)
+        if max_rep is not None:
+            exp.no_repeated_calls(max_rep)
+        if no_err:
             exp.no_tool_errors()
-        for rule in args.must_precede or []:
+        if shapes:
+            exp.no_secret_shapes()
+        for rule in must:
             parts = rule.split(":")
             if len(parts) not in (2, 3) or not all(parts):
-                print(f"bad --must-precede {rule!r}; use TARGET:PREREQ[:param]", file=sys.stderr)
+                err(f"bad --must-precede {rule!r}; use TARGET:PREREQ[:param]")
                 return 2
             exp.always_preceded_by(parts[0], parts[1], on=(parts[2] if len(parts) == 3 else "path",))
-        bad = [v for v in exp.check() if not v.ok]
+        results = exp.check()
+        bad = [v for v in results if not v.ok]
+        worst = max(worst, 1 if bad else 0)
+        if args.json:
+            report.append({
+                "trace": clean(path), "sha256": digest, "calls": traj.steps,
+                "ok": not bad,
+                "results": [{"ok": v.ok, "rule": clean(v.description, 2000),
+                             "detail": clean(v.detail, 4000)} for v in results],
+            })
+            continue
         status = "FAIL" if bad else "ok"
-        print(f"{status}  {path}  ({traj.steps} calls)")
+        print(f"{status}  {clean(path)}  ({traj.steps} calls)")
         if args.verbose or bad:
             print(exp.summary())
-        worst = max(worst, 1 if bad else 0)
+    if args.json:
+        print(json.dumps({"ok": worst == 0, "traces": report}, indent=2))
     return worst
+
+
+def cmd_diff(args) -> int:
+    """Compare two trace files' tool sequences. Exit 0 same, 1 different, 2 bad input."""
+    from trajtest import traces
+    from trajtest.expect import golden_diff
+    from trajtest.sanitize import clean
+
+    try:
+        a = traces.detect_and_load(traces.load_json_file(args.golden))
+        b = traces.detect_and_load(traces.load_json_file(args.actual))
+    except (OSError, ValueError) as exc:
+        print(clean(f"cannot read trace: {exc}"), file=sys.stderr)
+        return 2
+    diff = golden_diff(a, b, ordered=not args.unordered, args=args.args)
+    if not diff:
+        print(f"same ({b.steps} calls)")
+        return 0
+    for line in diff:
+        print(clean(line))
+    return 1
 
 
 def main(argv=None) -> int:
@@ -191,10 +277,21 @@ def main(argv=None) -> int:
     p_audit.add_argument("--fs-write-allow", action="append", help="absolute glob (repeatable)")
     p_audit.add_argument("--max-repeats", type=int, help="max identical calls (loop guard)")
     p_audit.add_argument("--no-tool-errors", action="store_true")
+    p_audit.add_argument("--http-host-allow", action="append", help="allowed hostname or *.suffix (parsed, https only; repeatable)")
+    p_audit.add_argument("--no-secret-shapes", action="store_true", help="fail if any call carries a credential-shaped value")
+    p_audit.add_argument("--policy", help="JSON policy file with the same rules (keys: allow_tools, http_allow, http_host_allow, fs_write_allow, max_repeats, no_tool_errors, no_secret_shapes, must_precede, tools)")
+    p_audit.add_argument("--json", action="store_true", help="machine-readable report incl. trace SHA-256")
     p_audit.add_argument("--must-precede", action="append", help="TARGET:PREREQ[:param]")
     p_audit.add_argument("--tool", action="append", help="a tool name the agent had (repeatable)")
     p_audit.add_argument("-v", "--verbose", action="store_true")
     p_audit.set_defaults(func=cmd_audit)
+
+    p_diff = sub.add_parser("diff", help="compare tool sequences of a golden and a new trace")
+    p_diff.add_argument("golden")
+    p_diff.add_argument("actual")
+    p_diff.add_argument("--unordered", action="store_true", help="compare as multisets")
+    p_diff.add_argument("--args", action="store_true", help="also compare arguments")
+    p_diff.set_defaults(func=cmd_diff)
 
     args = parser.parse_args(argv)
     # strip a leading "--" from passthrough args

@@ -19,8 +19,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from trajtest.errors import MaxStepsExceeded
-from trajtest.sanitize import clean
+from trajtest.errors import AgentTimeout, MaxStepsExceeded
+from trajtest.sanitize import clean, clip
 from trajtest.world import World
 
 _RESULT_REPR_LIMIT = 500
@@ -44,8 +44,8 @@ class ToolCall:
     """
 
     def short(self) -> str:
-        arg_strs = [repr(a) for a in self.args]
-        arg_strs += [f"{k}={v!r}" for k, v in self.kwargs.items()]
+        arg_strs = [clip(repr(a), 400) for a in self.args]
+        arg_strs += [f"{k}={clip(repr(v), 400)}" for k, v in self.kwargs.items()]
         err = f" !! {self.error}" if self.error else ""
         # Untrusted text: secrets masked, control/bidi/newline chars escaped.
         line = clean(f"#{self.step} {self.name}({', '.join(arg_strs)}){err}")
@@ -100,11 +100,15 @@ class Trajectory:
 
         return traces.from_dict(data)
 
-    def save(self, path) -> None:
-        """Write the trajectory as JSON (e.g. a golden/baseline trace)."""
+    def save(self, path, redact: bool = True) -> None:
+        """Write the trajectory as JSON (e.g. a golden/baseline trace).
+
+        Secret-looking values are masked by default; redact=False keeps
+        raw values. The write is atomic.
+        """
         from trajtest import traces
 
-        traces.save(self, path)
+        traces.save(self, path, redact=redact)
 
     @classmethod
     def load(cls, path) -> "Trajectory":
@@ -148,8 +152,8 @@ class Trajectory:
         lines.append(
             clean(
                 f"-> finished={self.finished} steps={self.steps} "
-                f"answer={self.final_answer!r}"
-                + (f" failure={self.failure!r}" if self.failure else "")
+                f"answer={clip(repr(self.final_answer), 400)}"
+                + (f" failure={clip(repr(self.failure), 400)}" if self.failure else "")
             )
         )
         return "\n".join(lines)
@@ -158,10 +162,12 @@ class Trajectory:
 def _truncate_repr(value) -> str:
     from trajtest.sanitize import redact
 
-    text = redact(repr(value))
-    if len(text) > _RESULT_REPR_LIMIT:
-        return text[:_RESULT_REPR_LIMIT] + "…"
-    return text
+    # Bound first: repr+redact of a 20 MB value cost seconds. Slightly more
+    # than the limit is kept so a secret straddling it is still matched.
+    raw = repr(value)
+    cut = len(raw) > _RESULT_REPR_LIMIT
+    text = redact(raw[: _RESULT_REPR_LIMIT + 200])
+    return text[:_RESULT_REPR_LIMIT] + "…" if cut or len(text) > _RESULT_REPR_LIMIT else text
 
 
 class _Tools:
@@ -200,6 +206,7 @@ class _Tools:
         self._max_steps = max_steps
         self._lock = threading.RLock()
         self._wrapped: dict = {}
+        self._cancelled = False
         self._impls = {
             "fs_read": world.fs.read,
             "fs_write": world.fs.write,
@@ -240,7 +247,11 @@ class _Tools:
             if name not in cache:
                 cache[name] = self._wrap(name, impls[name])
             return cache[name]
-        raise AttributeError(f"trajtest has no tool {name!r}")
+        import difflib
+
+        close = difflib.get_close_matches(name, list(impls) + ["note"], n=1)
+        hint = f" (did you mean {close[0]!r}?)" if close else ""
+        raise AttributeError(f"trajtest has no tool {name!r}{hint}")
 
     def _note(self, text: str) -> None:
         with self._lock:
@@ -283,6 +294,8 @@ class _Tools:
             # Step numbering and the budget check are atomic so threads
             # cannot produce duplicate step ids.
             with self._lock:
+                if self._cancelled:  # timed-out agent: freeze the trajectory
+                    return
                 self._traj.calls.append(
                     ToolCall(
                         step=len(self._traj.calls) + 1,
@@ -298,6 +311,8 @@ class _Tools:
 
         def recorded(*args, **kwargs):
             with self._lock:
+                if self._cancelled:
+                    raise AgentTimeout("agent was cancelled after run(timeout=...)")
                 if len(self._traj.calls) >= self._max_steps:
                     raise MaxStepsExceeded(
                         f"agent exceeded max_steps={self._max_steps} "
@@ -408,9 +423,30 @@ def _drive_awaitable(awaitable):
         except BaseException as exc:  # noqa: BLE001 - re-raised in caller
             box["error"] = exc
 
-    th = threading.Thread(target=target, name="trajtest-async-agent")
+    th = threading.Thread(target=target, name="trajtest-async-agent", daemon=True)
     th.start()
     th.join()
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+def _call_with_timeout(agent, task, handle, seed, timeout):
+    box: dict = {}
+
+    def target():
+        try:
+            box["value"] = _call_agent(agent, task, handle, seed)
+        except BaseException as exc:  # noqa: BLE001 - re-raised in caller
+            box["error"] = exc
+
+    th = threading.Thread(target=target, name="trajtest-agent", daemon=True)
+    th.start()
+    th.join(timeout)
+    with handle._lock:
+        if th.is_alive():
+            handle._cancelled = True
+            raise AgentTimeout(f"agent still running after {timeout}s")
     if "error" in box:
         raise box["error"]
     return box["value"]
@@ -424,6 +460,7 @@ def run(
     max_steps: int = 25,
     seed=None,
     tools: "dict | None" = None,
+    timeout: "float | None" = None,
 ) -> Trajectory:
     """Run an agent against a mock world; record its trajectory.
 
@@ -433,6 +470,11 @@ def run(
     tools: optional {name: callable} of custom tools (send_email, shell,
            search, ...). They are recorded exactly like built-ins, appear
            in traj.registered, and cannot shadow a built-in.
+    timeout: optional wall-clock seconds. The agent then runs in a daemon
+           thread; on expiry the trajectory is frozen with
+           failure="AgentTimeout..." and the agent's next tool call raises.
+           A Python thread cannot be killed, so an agent stuck in a tool-free
+           loop keeps burning CPU in the background until the process exits.
     """
     if max_steps < 1:
         raise ValueError("max_steps must be >= 1")
@@ -449,9 +491,17 @@ def run(
     traj.registered = [n for n in _Tools.REGISTERED] + [
         n for n in (tools or {}) if n not in _Tools.REGISTERED
     ]
+    if timeout is not None and not (timeout > 0):
+        raise ValueError("timeout must be > 0 seconds")
     try:
-        traj.final_answer = _call_agent(agent, task, handle, seed)
+        if timeout is None:
+            traj.final_answer = _call_agent(agent, task, handle, seed)
+        else:
+            traj.final_answer = _call_with_timeout(agent, task, handle, seed, timeout)
         traj.finished = True
+    except AgentTimeout as exc:
+        traj.finished = False
+        traj.failure = f"AgentTimeout: {exc}"
     except MaxStepsExceeded as exc:
         traj.finished = False
         traj.failure = str(exc)
@@ -469,6 +519,7 @@ def sample(
     n: int = 5,
     max_steps: int = 25,
     seed_start: int = 0,
+    timeout: "float | None" = None,
 ) -> list[Trajectory]:
     """Run the agent n times against fresh worlds (for stochastic agents).
 
@@ -485,5 +536,5 @@ def sample(
     for i in range(n):
         world = world_factory()
         seed = seed_start + i if use_seed else None
-        trajs.append(run(agent, task, world, max_steps=max_steps, seed=seed))
+        trajs.append(run(agent, task, world, max_steps=max_steps, seed=seed, timeout=timeout))
     return trajs

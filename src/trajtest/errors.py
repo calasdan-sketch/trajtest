@@ -23,3 +23,8 @@ class UnmockedRequestError(Exception):
 
 class FSQuotaExceeded(OSError):
     """Raised by FakeFS when total content would exceed the world's quota."""
+
+
+class AgentTimeout(BaseException):
+    """run(timeout=...) expired. A BaseException so an agent's own
+    `except Exception` cannot swallow the cancellation."""

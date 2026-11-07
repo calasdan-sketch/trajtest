@@ -14,14 +14,16 @@ assert_all() reports EVERYTHING that failed — plus a trajectory transcript —
 in a single EvalFailure. check() returns the violations without raising.
 """
 
+import base64
 import difflib
 import fnmatch
+import re
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from trajtest import matchers as m
 from trajtest.errors import EvalFailure
-from trajtest.sanitize import clean
+from trajtest.sanitize import clean, clip
 from trajtest.world import _norm, _segments_match
 
 _MISSING = object()
@@ -35,9 +37,9 @@ class Violation:
 
     def line(self) -> str:
         mark = "✓" if self.ok else "✗"
-        text = f"  {mark} {clean(self.description)}"
+        text = f"  {mark} {clean(self.description, 2000)}"
         if not self.ok and self.detail:
-            text += f"\n      {clean(self.detail)}"
+            text += f"\n      {clean(self.detail, 4000)}"
         return text
 
 
@@ -50,8 +52,10 @@ def call_matches(call, args, kwargs) -> bool:
     """
     if len(args) > len(call.args):
         return False
-    for expected, actual in zip(args, call.args):
-        if not m.to_matcher(expected).matches(actual):
+    for i, (expected, actual) in enumerate(zip(args, call.args)):
+        matcher = m.to_matcher(expected)
+        alts = _path_alts(call, "path" if i == 0 else None, actual)
+        if not any(matcher.matches(a) for a in alts):
             return False
     bound = call.bound or {}
     for key, expected in kwargs.items():
@@ -59,9 +63,30 @@ def call_matches(call, args, kwargs) -> bool:
         actual = bound.get(name, _MISSING)
         if actual is _MISSING:
             actual = call.kwargs.get(name, _MISSING)
-        if actual is _MISSING or not matcher.matches(actual):
+        if actual is _MISSING:
+            return False
+        if not any(matcher.matches(a) for a in _path_alts(call, name, actual)):
             return False
     return True
+
+
+def _path_alts(call, name, actual) -> list:
+    """For fs_* path arguments also offer the normalised path.
+
+    The mock FS resolves '/data/./x', '//data/x' and '/tmp/../data/x' to
+    the same file, so a raw-string comparison let
+    never_called("fs_delete", path="/data/x") pass while the file WAS
+    deleted. Matching is "raw OR normalised", i.e. fail-closed for
+    never_called.
+    """
+    if name == "path" and call.name.startswith("fs_") and isinstance(actual, str):
+        try:
+            n = _norm(actual)
+        except ValueError:
+            return [actual]
+        if n != actual:
+            return [actual, n]
+    return [actual]
 
 
 _FS_MUTATORS = ("fs_write", "fs_append", "fs_delete")
@@ -80,6 +105,21 @@ def _arg(call, name: str, pos: int):
     return _MISSING_ARG
 
 
+def _arg_all(call, name: str, pos: int) -> list:
+    """Every distinct value a call carries for a parameter.
+
+    Imported traces store args, kwargs and `bound` separately; a doctored
+    file can make them disagree (bound says /out/x, args say /etc/passwd).
+    Checks must hold for ALL of them, so disagreement fails closed.
+    """
+    vals = []
+    for v in ((call.bound or {}).get(name, _MISSING_ARG), call.kwargs.get(name, _MISSING_ARG),
+              call.args[pos] if pos < len(call.args) else _MISSING_ARG):
+        if v is not _MISSING_ARG and not any(v is x or (type(v) is type(x) and v == x) for x in vals):
+            vals.append(v)
+    return vals or [_MISSING_ARG]
+
+
 def _url_pos(call) -> int:
     return 1 if call.name == "http_request" else 0
 
@@ -90,11 +130,84 @@ def _fmt_call_args(call) -> str:
     return ", ".join(parts)
 
 
+def _flatten(v, depth=0) -> str:
+    """Searchable text of an arbitrary args tree (bounded depth/size)."""
+    if depth > 20:
+        return "<deep>"
+    if isinstance(v, str):
+        return v
+    if isinstance(v, bytes):
+        return v.decode("utf-8", "replace")
+    if isinstance(v, dict):
+        return "\n".join(f"{_flatten(k, depth + 1)}={_flatten(x, depth + 1)}" for k, x in v.items())
+    if isinstance(v, (list, tuple, set, frozenset)):
+        return "\n".join(_flatten(x, depth + 1) for x in v)
+    return repr(v)
+
+
+_HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def _host_ok(url, allowed, schemes) -> bool:
+    if not isinstance(url, str) or any(ord(ch) < 32 or ord(ch) == 127 or ch in "\\ " for ch in url):
+        return False
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        parts.port  # noqa: B018 - validates the port
+    except ValueError:
+        return False
+    if parts.scheme.lower() not in schemes or not host or "@" in parts.netloc:
+        return False
+    host = host.lower().rstrip(".")
+    if not host.isascii():
+        return False
+    ipish = all(ch.isdigit() or ch in ".:" for ch in host) or ":" in host
+    if not ipish and not all(_HOST_LABEL.match(lab) for lab in host.split(".")):
+        return False
+    for a in allowed:
+        if a.startswith("*.") and not ipish and host.endswith(a[1:]) and len(host) > len(a) - 1:
+            return True
+        if host == a.rstrip("."):
+            return True
+    return False
+
+
+def golden_diff(golden, actual, *, ordered=True, args=False) -> list:
+    """Human-readable differences between two trajectories ([] = same)."""
+    from trajtest.traces import _mask
+
+    def key(c):
+        # masked on both sides: a golden saved with redaction must still
+        # equal the live run it came from
+        if not args:
+            return (c.name,)
+        return (c.name, repr(_mask(list(c.args))), repr(sorted(_mask(dict(c.kwargs)).items(), key=lambda kv: kv[0])))
+
+    g, a = [key(c) for c in golden.calls], [key(c) for c in actual.calls]
+    if not ordered:
+        from collections import Counter
+
+        cg, ca = Counter(g), Counter(a)
+        out = [f"missing {k[0]} x{n}" for k, n in (cg - ca).items()]
+        return out + [f"unexpected {k[0]} x{n}" for k, n in (ca - cg).items()]
+    out = []
+    sm = difflib.SequenceMatcher(a=g, b=a, autojunk=False)
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            continue
+        want = [k[0] for k in g[i1:i2]]
+        got = [k[0] for k in a[j1:j2]]
+        out.append(f"at step {j1 + 1}: expected {want or '-'}, got {got or '-'}")
+    return out
+
+
 class Expect:
     def __init__(self, traj):
         self.traj = traj
         self._violations: list[Violation] = []
         self._chain_cursor = 0  # for then()/then_immediately() chains
+        self._mask: list = []  # known secrets: never printed in reports
 
     # -- internal ------------------------------------------------------
     def _record(self, ok: bool, description: str, detail: str = "") -> "Expect":
@@ -409,16 +522,22 @@ class Expect:
         for c in self.traj.calls:
             if c.name not in _FS_MUTATORS:
                 continue
-            raw = _arg(c, "path", 0)
-            try:
-                if raw is _MISSING_ARG:
-                    raise ValueError("no path argument")
-                segs = [x for x in _norm(raw).split("/") if x]
-            except (ValueError, TypeError):
-                bad.append(f"{c.short()} (path unresolvable)")
-                continue
-            if not any(_segments_match(segs, p) for p in pats):
-                bad.append(c.short())
+            for raw in _arg_all(c, "path", 0):
+                try:
+                    if raw is _MISSING_ARG:
+                        raise ValueError("no path argument")
+                    # A backslash is a separator on Windows but an ordinary
+                    # character here: '/out/..\\..\\etc' would pass as a
+                    # file inside /out. Fail closed instead of guessing.
+                    if "\\" in raw or "\x00" in raw or re.search(r"%2[ef]", raw, re.IGNORECASE):
+                        raise ValueError("ambiguous separator")
+                    segs = [x for x in _norm(raw).split("/") if x]
+                except (ValueError, TypeError):
+                    bad.append(f"{c.short()} (path unresolvable or ambiguous)")
+                    break
+                if not any(_segments_match(segs, p) for p in pats):
+                    bad.append(c.short())
+                    break
         if not bad:
             return self._record(True, desc)
         return self._record(False, desc, f"{len(bad)} write(s) outside scope: " + "; ".join(bad[:3]))
@@ -437,16 +556,17 @@ class Expect:
         for c in self.traj.calls:
             if not c.name.startswith("http_"):
                 continue
-            url = _arg(c, "url", _url_pos(c))
-            if not isinstance(url, str) or any(ord(ch) < 32 for ch in url):
-                bad.append(f"{c.short()} (url unresolvable)")
-                continue
-            try:
-                spoof = "@" in urlsplit(url).netloc
-            except ValueError:
-                spoof = True
-            if spoof or not any(fnmatch.fnmatchcase(url, p) for p in patterns):
-                bad.append(c.short())
+            for url in _arg_all(c, "url", _url_pos(c)):
+                if not isinstance(url, str) or any(ord(ch) < 32 or ch == "\\" for ch in url):
+                    bad.append(f"{c.short()} (url unresolvable)")
+                    break
+                try:
+                    spoof = "@" in urlsplit(url).netloc
+                except ValueError:
+                    spoof = True
+                if spoof or not any(fnmatch.fnmatchcase(url, p) for p in patterns):
+                    bad.append(c.short())
+                    break
         if not bad:
             return self._record(True, desc)
         return self._record(False, desc, f"{len(bad)} request(s) outside egress allowlist: " + "; ".join(bad[:3]))
@@ -461,19 +581,13 @@ class Expect:
         on = (on,) if isinstance(on, str) else tuple(on)
         desc = f'always_preceded_by("{target}", "{prerequisite}", on={on})'
         bad = []
-        calls = self.traj.calls
-        for i, c in enumerate(calls):
-            if c.name != target:
-                continue
-            want = [_arg(c, k, 0) for k in on]
-            ok = any(
-                p.name == prerequisite
-                and p.error is None
-                and [_arg(p, k, 0) for k in on] == want
-                for p in calls[:i]
-            )
-            if not ok:
+        seen: set = set()  # repr-keyed so unhashable args work; one pass, O(n)
+        for c in self.traj.calls:
+            key = repr([_arg(c, k, 0) for k in on])
+            if c.name == target and key not in seen:
                 bad.append(c.short())
+            if c.name == prerequisite and c.error is None:
+                seen.add(key)
         if not bad:
             return self._record(True, desc)
         return self._record(False, desc, f"{len(bad)} call(s) without prerequisite: " + "; ".join(bad[:3]))
@@ -499,6 +613,109 @@ class Expect:
             return self._record(True, "no_tool_errors()")
         return self._record(False, "no_tool_errors()", f"{len(errs)} failed call(s): " + "; ".join(c.short() for c in errs[:3]))
 
+    def http_hosts_confined_to(self, *hosts: str, schemes=("https",)) -> "Expect":
+        """Host-based egress allowlist (parsed, not string-matched).
+
+        `hosts` are exact names or ``*.suffix`` wildcards, compared
+        case-insensitively against the URL's real hostname, so
+        ``HTTPS://API.Example.com:443/x`` is recognised and
+        ``https://api.example.com.evil.net/`` or ``https://evil.net/?h=api.example.com``
+        are not. Fails closed on userinfo, backslashes, control characters,
+        non-ASCII (IDN) hosts, IP literals not listed verbatim, missing
+        scheme/host, and any scheme outside `schemes` (default https only).
+        """
+        desc = f"http_hosts_confined_to({', '.join(repr(h) for h in hosts)})"
+        if not hosts:
+            raise ValueError("http_hosts_confined_to needs at least one host")
+        allowed = [h.lower() for h in hosts]
+        schemes = tuple(x.lower() for x in schemes)
+        bad = []
+        for c in self.traj.calls:
+            if not c.name.startswith("http_"):
+                continue
+            for url in _arg_all(c, "url", _url_pos(c)):
+                if not _host_ok(url, allowed, schemes):
+                    bad.append(c.short())
+                    break
+        if not bad:
+            return self._record(True, desc)
+        return self._record(False, desc, f"{len(bad)} request(s) to hosts outside allowlist: " + "; ".join(bad[:3]))
+
+    def no_data_leak(self, *values: str, tools=("http_*",)) -> "Expect":
+        """None of `values` (secrets/PII planted in the world) may appear in
+        the arguments of calls to `tools` (fnmatch names; default all HTTP).
+
+        Searches nested args as raw text, URL-encoded, and base64 (std and
+        urlsafe), case-sensitively. Build secret values at runtime in the
+        test, never commit them. Reports only a short fingerprint of the
+        leaked value, not the value.
+        """
+        desc = f"no_data_leak({len(values)} value(s), tools={tuple(tools)!r})"
+        vals = [v for v in values if isinstance(v, str)]
+        if not vals or len(vals) != len(values) or any(len(v) < 4 for v in vals):
+            raise ValueError("no_data_leak needs non-empty strings of at least 4 characters")
+        needles = []
+        self._mask += vals
+        for i, v in enumerate(vals):
+            raw = v.encode("utf-8")
+            forms = {v, quote(v, safe=""), quote(v), base64.b64encode(raw).decode(),
+                     base64.urlsafe_b64encode(raw).decode(), base64.b64encode(raw).decode().rstrip("=")}
+            needles += [(i, f) for f in forms if f]
+        hits = []
+        for c in self.traj.calls:
+            if not any(fnmatch.fnmatchcase(c.name, t) for t in tools):
+                continue
+            blob = _flatten(c.args) + "\n" + _flatten(c.kwargs) + "\n" + _flatten(c.bound)
+            views = (blob, unquote(blob), unquote(unquote(blob)))  # %2D-style encodings
+            for i, n in needles:
+                if any(n in v for v in views):
+                    hits.append(f"#{c.step} {c.name} carries value {i + 1}")
+                    break
+        if not hits:
+            return self._record(True, desc)
+        return self._record(False, desc, f"{len(hits)} leaking call(s): " + "; ".join(hits[:5]))
+
+    def no_secret_shapes(self, tools=("*",)) -> "Expect":
+        """No call to `tools` carries a credential-shaped string or a
+        secret-looking key with a value (same shapes the report redactor
+        masks: sk-..., ghp_..., AKIA..., JWTs, ?api_key=..., PEM keys)."""
+        from trajtest.sanitize import redact
+
+        desc = f"no_secret_shapes(tools={tuple(tools)!r})"
+        hits = []
+        for c in self.traj.calls:
+            if not any(fnmatch.fnmatchcase(c.name, t) for t in tools):
+                continue
+            # repr form too: dict reprs expose 'api_key': '...' pairs
+            blob = clip(repr(c.args) + " " + repr(c.kwargs) + " " + _flatten(c.args) + " " + _flatten(c.kwargs), 200000)
+            if redact(blob) != blob:
+                hits.append(f"#{c.step} {c.name}")
+        if not hits:
+            return self._record(True, desc)
+        return self._record(False, desc, f"{len(hits)} call(s) carry credential-like data: " + "; ".join(hits[:5]))
+
+    def retried_after_error(self, name: str) -> "Expect":
+        """`name` failed at least once and a LATER call to it succeeded
+        (the retry logic actually ran; pairs with flaky() and mock 500s)."""
+        desc = f'retried_after_error("{name}")'
+        if bad := self._unknown_name(desc, name):
+            return bad
+        calls = self.traj.calls_to(name)
+        first_err = next((i for i, c in enumerate(calls) if c.error), None)
+        if first_err is None:
+            return self._record(False, desc, f"no call to {name!r} failed, nothing to retry")
+        if any(c.error is None for c in calls[first_err + 1 :]):
+            return self._record(True, desc)
+        return self._record(False, desc, f"{name!r} failed and was never successfully retried")
+
+    def same_tools_as(self, golden, *, ordered: bool = True, args: bool = False) -> "Expect":
+        """Regression check against a golden Trajectory: same tool-name
+        sequence (or same multiset if ordered=False); args=True also
+        requires identical positional/keyword args."""
+        desc = f"same_tools_as(golden, ordered={ordered}, args={args})"
+        diff = golden_diff(golden, self.traj, ordered=ordered, args=args)
+        return self._record(not diff, desc, "; ".join(diff[:5]))
+
     # -- verdict ---------------------------------------------------------
     def check(self) -> list[Violation]:
         """Return all violations without raising.
@@ -516,8 +733,14 @@ class Expect:
             ]
         return list(self._violations)
 
+    def _masked(self, text: str) -> str:
+        for secret in sorted(set(self._mask), key=len, reverse=True):
+            for form in (secret, quote(secret, safe=""), quote(secret), repr(secret)[1:-1]):
+                text = text.replace(form, "«redacted»")
+        return text
+
     def summary(self) -> str:
-        return "\n".join(v.line() for v in self._violations)
+        return self._masked("\n".join(v.line() for v in self._violations))
 
     def assert_all(self) -> None:
         """Raise EvalFailure listing every failed assertion + transcript.
@@ -543,7 +766,7 @@ class Expect:
             ),
             self.summary(),
             f"Trajectory ({self.traj.steps} steps):",
-            self.traj.transcript(),
+            self._masked(self.traj.transcript()),
         ]
         raise EvalFailure("\n".join(report))
 

@@ -1,14 +1,15 @@
 """Re-runnable micro-benchmarks. Usage: python bench/bench.py
 
-Prints median-of-5 timings for three things the experts found slow or
-unbounded in v0.1. Numbers depend on your machine; compare before/after
+Prints median-of-5 timings for things the experts found slow or
+unbounded. Numbers depend on your machine; compare before/after
 on the SAME machine.
 """
 
 import statistics
 import time
 
-from trajtest import World, run
+from trajtest import Expect, Trajectory, World, run
+from trajtest.sanitize import redact
 
 
 def timeit(fn, repeat=5):
@@ -46,7 +47,38 @@ def bench_glob_many_files(files=3000):
     return timeit(lambda: w.fs.glob("/src/**/mod*.py"), repeat=3)
 
 
+def bench_big_value_report(mb=8):
+    """Print the transcript of a run that read and wrote an `mb` MB value."""
+    big = "x" * (mb * 1024 * 1024)
+
+    def agent(task, tools):
+        tools.fs_write("/a", big)
+        tools.fs_read("/a")
+        return big
+
+    def go():
+        t = run(agent, "t", World())
+        t.transcript()
+
+    return timeit(go, repeat=3)
+
+
+def bench_preceded_by(n=20000):
+    calls = [{"name": "fs_read", "args": [f"/f{i}"]} for i in range(n)]
+    calls += [{"name": "fs_delete", "args": [f"/f{i}"]} for i in range(n)]
+    t = Trajectory.from_dict({"schema": 1, "calls": calls})
+    return timeit(lambda: Expect(t).always_preceded_by("fs_delete", "fs_read").check(), repeat=3)
+
+
+def bench_redact_hostile(n=30000):
+    text = "token='x\" " * n
+    return timeit(lambda: redact(text), repeat=3)
+
+
 if __name__ == "__main__":
     print(f"tool-call overhead      : {bench_call_overhead():8.2f} us/call")
     print(f"glob 6x'**' 30 deep     : {bench_glob() * 1000:8.1f} ms")
     print(f"glob over 3000 files    : {bench_glob_many_files() * 1000:8.1f} ms")
+    print(f"report for 8 MB value   : {bench_big_value_report() * 1000:8.1f} ms")
+    print(f"preceded_by 40k calls   : {bench_preceded_by() * 1000:8.1f} ms")
+    print(f"redact 300 KB hostile   : {bench_redact_hostile() * 1000:8.1f} ms")

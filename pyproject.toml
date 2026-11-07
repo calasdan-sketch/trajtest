@@ -25,5 +25,8 @@ trajtest = "trajtest.pytest_plugin"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+trajtest = ["py.typed"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
