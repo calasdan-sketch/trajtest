@@ -70,7 +70,7 @@ def cmd_init(args) -> int:
     if os.path.exists(path) and not args.force:
         print(f"{path} already exists (use --force to overwrite)")
         return 1
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(SCAFFOLD.replace("__SCAFFOLD_NAME__", name))
     print(f"wrote {path}")
     print("run it with: trajtest run " + path)

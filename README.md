@@ -48,8 +48,10 @@ Prompt-tests can't see the four ways agents actually fail:
 
 ## Install
 
+Not on PyPI yet; install from a clone of this repo:
+
 ```bash
-pip install trajtest
+pip install .
 ```
 
 ## Core concepts
