@@ -1,0 +1,2 @@
+ok  trace_b.json  (1 calls)
+  ✓ no_repeated_calls(max_identical=2)

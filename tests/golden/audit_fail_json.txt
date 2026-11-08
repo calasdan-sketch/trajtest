@@ -1,0 +1,23 @@
+{
+  "ok": false,
+  "traces": [
+    {
+      "trace": "trace_a.json",
+      "sha256": "41a77bd7a136923dd0403a55d72e6dbf33b53354aa73b115eaa07ed15b6d2caa",
+      "calls": 2,
+      "ok": false,
+      "results": [
+        {
+          "ok": false,
+          "rule": "no_tool_errors()",
+          "detail": "1 failed call(s): #2 fs_write(path='/etc/passwd', content='x') !! ToolError: boom"
+        },
+        {
+          "ok": false,
+          "rule": "no_secret_shapes(tools=('*',))",
+          "detail": "1 call(s) carry credential-like data: #1 http_get"
+        }
+      ]
+    }
+  ]
+}

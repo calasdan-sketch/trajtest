@@ -3,9 +3,10 @@
 import argparse
 import hashlib
 import json
+import os
 import sys
 
-from trajtest import __version__
+from trajtest import __author__, __version__
 
 SCAFFOLD = '''"""Example trajectory eval. Run with: trajtest run __SCAFFOLD_NAME__"""
 
@@ -64,16 +65,24 @@ def test_agent_does_not_lie_about_saving():
 
 
 def cmd_init(args) -> int:
-    import os
-
-    os.makedirs(args.dir, exist_ok=True)
+    try:
+        os.makedirs(args.dir, exist_ok=True)
+    except OSError as exc:
+        print(f"trajtest init: cannot create {args.dir}: {exc}", file=sys.stderr)
+        return 2
     name = "test_trajtest_example.py"
     path = os.path.join(args.dir, name)
     if os.path.exists(path) and not args.force:
         print(f"{path} already exists (use --force to overwrite)")
         return 1
-    with open(path, "w") as f:
-        f.write(SCAFFOLD.replace("__SCAFFOLD_NAME__", name))
+    try:
+        # explicit UTF-8: the scaffold has non-ASCII characters and the
+        # platform default (cp1252 on Windows, ASCII under LANG=C) would crash
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(SCAFFOLD.replace("__SCAFFOLD_NAME__", name))
+    except OSError as exc:
+        print(f"trajtest init: cannot write {path}: {exc}", file=sys.stderr)
+        return 2
     print(f"wrote {path}")
     print("run it with: trajtest run " + path)
     return 0
@@ -125,7 +134,7 @@ def _load_policy(path) -> dict:
 
     data = traces.load_json_file(path)
     if not isinstance(data, dict):
-        raise ValueError("policy must be a JSON object")
+        raise ValueError("policy must be a JSON object")  # noqa: TRY004
     for k, v in data.items():
         if k not in _POLICY_KEYS:
             raise ValueError(f"unknown policy key {k!r}")
@@ -204,21 +213,62 @@ def cmd_audit(args) -> int:
         results = exp.check()
         bad = [v for v in results if not v.ok]
         worst = max(worst, 1 if bad else 0)
+        report.append({
+            "trace": clean(path), "sha256": digest, "calls": traj.steps,
+            "ok": not bad,
+            "results": [{"ok": v.ok, "rule": clean(v.description, 2000),
+                         "detail": clean(v.detail, 4000)} for v in results],
+        })
         if args.json:
-            report.append({
-                "trace": clean(path), "sha256": digest, "calls": traj.steps,
-                "ok": not bad,
-                "results": [{"ok": v.ok, "rule": clean(v.description, 2000),
-                             "detail": clean(v.detail, 4000)} for v in results],
-            })
             continue
         status = "FAIL" if bad else "ok"
         print(f"{status}  {clean(path)}  ({traj.steps} calls)")
         if args.verbose or bad:
             print(exp.summary())
+    if args.junit:
+        try:
+            _write_junit(args.junit, report)
+        except OSError as exc:
+            err(f"cannot write {args.junit}: {exc}")
+            return 2
     if args.json:
         print(json.dumps({"ok": worst == 0, "traces": report}, indent=2))
     return worst
+
+
+def _write_junit(path, report) -> None:
+    """JUnit XML for CI dashboards (GitHub, GitLab, Jenkins...). One suite per
+    trace, one test case per rule. Text is pre-escaped by clean(); ElementTree
+    escapes XML syntax. Written atomically."""
+    import tempfile
+    import xml.etree.ElementTree as ET
+
+    root = ET.Element("testsuites", name="trajtest audit")
+    total = failed = 0
+    for t in report:
+        suite = ET.SubElement(root, "testsuite", name=t["trace"], tests=str(len(t["results"])),
+                              failures=str(sum(not r["ok"] for r in t["results"])))
+        for r in t["results"]:
+            case = ET.SubElement(suite, "testcase", classname="trajtest.audit", name=r["rule"])
+            total += 1
+            if not r["ok"]:
+                failed += 1
+                ET.SubElement(case, "failure", message=r["detail"] or "rule violated").text = r["detail"]
+    root.set("tests", str(total))
+    root.set("failures", str(failed))
+    data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    d = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def cmd_diff(args) -> int:
@@ -247,7 +297,7 @@ def main(argv=None) -> int:
         prog="trajtest", description="pytest for agent trajectories"
     )
     parser.add_argument(
-        "--version", action="version", version=f"trajtest {__version__}"
+        "--version", action="version", version=f"trajtest {__version__} ({__author__})"
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -281,6 +331,7 @@ def main(argv=None) -> int:
     p_audit.add_argument("--no-secret-shapes", action="store_true", help="fail if any call carries a credential-shaped value")
     p_audit.add_argument("--policy", help="JSON policy file with the same rules (keys: allow_tools, http_allow, http_host_allow, fs_write_allow, max_repeats, no_tool_errors, no_secret_shapes, must_precede, tools)")
     p_audit.add_argument("--json", action="store_true", help="machine-readable report incl. trace SHA-256")
+    p_audit.add_argument("--junit", metavar="FILE", help="also write a JUnit XML report (for CI test dashboards)")
     p_audit.add_argument("--must-precede", action="append", help="TARGET:PREREQ[:param]")
     p_audit.add_argument("--tool", action="append", help="a tool name the agent had (repeatable)")
     p_audit.add_argument("-v", "--verbose", action="store_true")
@@ -293,11 +344,26 @@ def main(argv=None) -> int:
     p_diff.add_argument("--args", action="store_true", help="also compare arguments")
     p_diff.set_defaults(func=cmd_diff)
 
+    # Untrusted or non-ASCII text must never crash the CLI on a narrow
+    # console (LANG=C, Windows cp1252): degrade to backslash escapes.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
+            pass
     args = parser.parse_args(argv)
     # strip a leading "--" from passthrough args
     if getattr(args, "pytest_args", None) and args.pytest_args[:1] == ["--"]:
         args.pytest_args = args.pytest_args[1:]
-    return args.func(args)
+    try:
+        return args.func(args)
+    except BrokenPipeError:
+        # e.g. `trajtest audit ... --json | head`: not an error worth a traceback
+        try:
+            sys.stdout = open(os.devnull, "w")  # noqa: SIM115 - keep interpreter exit quiet
+        except OSError:
+            pass
+        return 141
 
 
 if __name__ == "__main__":

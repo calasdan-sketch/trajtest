@@ -1,0 +1,18 @@
+{
+  "ok": true,
+  "traces": [
+    {
+      "trace": "trace_b.json",
+      "sha256": "a3bf9c83a502adc0523c638dd16364f174a7ae88f63025d43754df4612ee5ec7",
+      "calls": 1,
+      "ok": true,
+      "results": [
+        {
+          "ok": true,
+          "rule": "fs_writes_confined_to('/out/*')",
+          "detail": ""
+        }
+      ]
+    }
+  ]
+}

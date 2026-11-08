@@ -32,6 +32,7 @@ from trajtest.stats import PassRate, assert_pass_rate, pass_rate
 from trajtest.world import Clock, FakeFS, FakeHTTP, FakeResponse, KVStore, World
 
 __version__ = "0.2.0"
+__author__ = "Calas Automations Inc."
 
 __all__ = [
     "ANY",

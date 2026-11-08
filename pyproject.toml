@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,10 +8,28 @@ version = "0.2.0"
 description = "pytest for agent trajectories: assert on what an agent did, not just what it said"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
-authors = [{ name = "Calas Automations" }]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Calas Automations Inc." }]
+maintainers = [{ name = "Calas Automations Inc." }]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Framework :: Pytest",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Testing",
+  "Typing :: Typed",
+]
 keywords = ["agents", "eval", "evals", "testing", "trajectory", "pytest"]
 dependencies = ["pytest>=7"]
+
+[project.optional-dependencies]
+dev = ["hypothesis>=6", "ruff", "mypy", "build", "twine"]
 
 [project.urls]
 Homepage = "https://calasautomations.com"

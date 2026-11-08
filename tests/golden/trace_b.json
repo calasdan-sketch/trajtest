@@ -1,0 +1,4 @@
+{"messages":[
+ {"role":"assistant","content":[{"type":"tool_use","id":"1","name":"fs_write","input":{"path":"/out/a","content":"x"}}]},
+ {"role":"assistant","content":[{"type":"text","text":"done"}]}
+]}

@@ -4,6 +4,24 @@
 
 Expert-review release. Backward compatible except where noted.
 
+### Round 5 (packaging, CI, test methodology)
+- Author/maintainer is now exactly "Calas Automations Inc." (pyproject,
+  `__author__`, `trajtest --version`, LICENSE). `LICENSE` was missing from the
+  repo and the wheel even though the metadata said MIT: added, SPDX
+  `license = "MIT"` + `license-files` (build now needs setuptools >= 77),
+  classifiers, maintainers, `[dev]` extra, `MANIFEST.in` (sdist gets CHANGELOG).
+- Fixed: `trajtest init` and `trajtest audit` crashed with `UnicodeEncodeError`
+  on an ASCII / cp1252 console or locale (init now writes UTF-8 with LF;
+  output degrades to backslash escapes). `init` into an unwritable place and
+  `audit | head` (broken pipe) no longer print tracebacks.
+- Added: `trajtest audit --junit FILE` (JUnit XML for CI dashboards; atomic
+  write; exit 2 with a plain message if unwritable). `--version` shows the author.
+- Tests: property-based tests (hypothesis; optional, skipped if absent),
+  golden-file tests for every CLI output format (`tests/golden/`,
+  `TRAJTEST_UPDATE_GOLDEN=1` regenerates), packaging/author pin tests, boundary
+  tests, and `bench/mutation_sanity.py` (flips 15 key conditions in a copy and
+  checks the suite fails). `.gitattributes` keeps golden files byte-exact on Windows.
+
 ### Fixed
 - **Async agents silently passed**: `async def` agents returned an un-awaited
   coroutine, `finished=True`, zero steps. They are now run to completion.

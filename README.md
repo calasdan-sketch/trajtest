@@ -49,7 +49,17 @@ Prompt-tests can't see the four ways agents actually fail:
 ## Install
 
 ```bash
-pip install trajtest
+pip install trajtest        # once released (see note)
+```
+
+**Note (2026-11-08):** 0.2.0 has not been uploaded to PyPI yet (`pip index
+versions trajtest` finds nothing). Until it is, install from a checkout or a
+built wheel:
+
+```bash
+pip install .                       # from a checkout of this repository
+trajtest --version                  # trajtest 0.2.0 (Calas Automations Inc.)
+trajtest init --dir evals && trajtest run evals/test_trajtest_example.py
 ```
 
 ## Core concepts
@@ -203,6 +213,22 @@ credentials are masked: values under keys like `Authorization`, `api_key`,
 assertions. Output is bounded before it is scanned (an 8 MB value prints in ~0.2 s, was ~13 s). URL query secrets (`?api_key=`), `user:pass@` URLs, PEM private keys and `sk_live_`/`github_pat_`/`AIza` shapes are masked. The mock FS has a 64 MiB quota counted in UTF-8 bytes (`World(fs_max_bytes=...)`) so a
 runaway agent can't exhaust CI memory; `fs_glob` is linear-time.
 
+### GitHub Actions / any CI
+
+`trajtest run` is pytest, so any CI runs it. To gate on recorded production
+traces and get a test-report tab, use `audit` with `--junit`:
+
+```yaml
+- run: pip install trajtest        # or: pip install .
+- run: trajtest audit traces/*.json --policy policy.json --junit audit.xml
+- uses: actions/upload-artifact@v4
+  if: always()
+  with: { name: trajtest-audit, path: audit.xml }
+```
+
+Exit codes: 0 clean, 1 a rule was violated, 2 bad input or no rules given.
+`--json` and `--junit` can be combined; stdout carries only the report.
+
 ## How it compares
 
 Measured on one Linux box, Python 3.13, fresh venvs, `pip install` of the
@@ -278,6 +304,11 @@ microseconds are not comparable across runs.)
 - `no_secret_shapes` and redaction key off key names containing `token`, `secret`, `password`, `api_key`...; a benign key like `tokenizer` is a false positive.
 - Tested on Python 3.13 locally; 3.10 is the declared floor and is
   exercised only by the CI workflow (unverified until it runs).
+- **Never run on Windows.** Paths, encodings and newlines were reviewed by
+  reading the code (UTF-8 is forced for files the tool writes; the console
+  falls back to backslash escapes instead of crashing), not by running it.
+- `mypy` is not clean (about ten annotation findings, no known runtime bug);
+  `py.typed` is shipped, so treat the type hints as best-effort.
 - **No framework adapters.** The agent is `(task, tools) -> str`;
   wrapping a LangChain/CrewAI loop takes ~5 lines on your side (or record
   its messages and use `from_openai_messages`).
@@ -286,4 +317,4 @@ microseconds are not comparable across runs.)
 
 ## License
 
-MIT
+MIT. Copyright (c) 2026 Calas Automations Inc. See `LICENSE`.
