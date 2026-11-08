@@ -14,6 +14,7 @@ assert_all() reports EVERYTHING that failed — plus a trajectory transcript —
 in a single EvalFailure. check() returns the violations without raising.
 """
 
+import json
 from dataclasses import dataclass
 
 from trajtest import matchers as m
@@ -140,6 +141,28 @@ class Expect:
         count = len(self.traj.calls_to(name))
         return self._record(
             count <= n, f'at_most({n}, "{name}")', f"found {count}" if count > n else ""
+        )
+
+    def no_repeated_calls(self, max_repeats: int = 2, name: str | None = None) -> "Expect":
+        """Loop detector: no identical (tool, args) call more than max_repeats times.
+
+        Args are normalised by parameter name, so a positional and a keyword
+        call with the same value count as the same call. Optionally scoped
+        to one tool `name`.
+        """
+        counts: dict = {}
+        for call in self.traj.calls:
+            if name is not None and call.name != name:
+                continue
+            args = call.bound or {"args": call.args, "kwargs": call.kwargs}
+            key = (call.name, json.dumps(args, sort_keys=True, default=repr))
+            counts[key] = counts.get(key, 0) + 1
+        over = [f"{tool}({args}) x{n}" for (tool, args), n in counts.items() if n > max_repeats]
+        scope = f', name="{name}"' if name else ""
+        return self._record(
+            not over,
+            f"no_repeated_calls(max_repeats={max_repeats}{scope})",
+            "repeated: " + "; ".join(over) if over else "",
         )
 
     def never_called(self, name: str, *args, **kwargs) -> "Expect":

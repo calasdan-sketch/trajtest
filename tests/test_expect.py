@@ -325,3 +325,34 @@ def test_chaining_returns_self(traj):
     exp = Expect(traj)
     assert exp.called("http_get") is exp
     assert exp.then("http_get") is exp
+
+
+def _poller(task, tools):
+    for _ in range(3):
+        tools.http_get("https://api.example.com/status")
+    tools.http_get("https://api.example.com/other")
+    tools.http_get(url="https://api.example.com/other")  # same call, by keyword
+    return "done"
+
+
+@pytest.fixture
+def poll_traj():
+    world = World()
+    world.http.mock("GET", "https://api.example.com/*", json={})
+    return run(_poller, "task", world)
+
+
+def test_no_repeated_calls_fails_over_limit(poll_traj):
+    with pytest.raises(EvalFailure, match="http_get"):
+        Expect(poll_traj).no_repeated_calls(max_repeats=2).assert_all()
+
+
+def test_no_repeated_calls_passes_at_limit(poll_traj):
+    Expect(poll_traj).no_repeated_calls(max_repeats=3).assert_all()
+
+
+def test_no_repeated_calls_different_args_not_repeats(poll_traj):
+    # /other twice (positional + keyword normalise to the same call), /status 3x
+    Expect(poll_traj).no_repeated_calls(max_repeats=2, name="fs_read").assert_all()
+    v = Expect(poll_traj).no_repeated_calls(max_repeats=2).check()
+    assert "/status" in v[0].detail and "/other" not in v[0].detail

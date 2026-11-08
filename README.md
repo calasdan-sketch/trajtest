@@ -100,6 +100,7 @@ reports *every* failure at once (fail-collecting, not fail-fast):
 | `then_immediately(name, ...)` | strict adjacency required |
 | `first / last` | boundary calls |
 | `completed_within(n)` / `finished()` | step budget / clean completion |
+| `no_repeated_calls(max_repeats=2, name=None)` | loop detector: fails if an identical (tool, args) call happens more than `max_repeats` times; different args don't count |
 | `final_answer(matcher-or-value)` | the agent's return value |
 | `notes_contain / notes_match` | narration assertions |
 | `world_file(path, equals/contains/matches)` | final world state — the anti-lying assertion |
