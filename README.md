@@ -126,6 +126,12 @@ traj = load_trace("run.jsonl")
 Expect(traj).in_order("read_file", "write_file").never_called("delete_file").assert_all()
 ```
 
+**traj.save_trace(path)** — the reverse: write a trajectory as a redbg
+trace (`.gz` suffix gzips it), so a failing eval can be replayed with
+`redbg replay` or compared with `redbg diff`. Args are written by parameter
+name; outputs are the recorded result reprs (truncated at 500 chars), so the
+file is for debugging, not a lossless copy of the mock world.
+
 **pytest plugin** — a `world` fixture (fresh `World` per test) is
 auto-registered. **CLI** — `trajtest init` scaffolds an example eval;
 `trajtest run <path>` runs evals through pytest.

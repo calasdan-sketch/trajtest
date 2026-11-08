@@ -68,3 +68,55 @@ def test_failed_and_unanswered_calls(tmp_path):
     assert traj.calls[1].error == "no result recorded"
     assert [n.text for n in traj.notes] == ["hmm"] and traj.notes[0].step == 2
     assert traj.finished is False and "session_end" in traj.failure
+
+
+def _agent(task, tools):
+    tools.http_get("https://api.example.com/rows")
+    tools.note("got rows")
+    tools.fs_write("/out/r.md", content="total: 6")
+    try:
+        tools.fs_read("/missing")
+    except FileNotFoundError:
+        pass
+    return "total: 6"
+
+
+def _run():
+    from trajtest import World, run
+
+    world = World()
+    world.http.mock("GET", "https://api.example.com/rows", json={"rows": [1]})
+    return run(_agent, "task", world)
+
+
+def test_save_trace_round_trip(tmp_path):
+    traj = _run()
+    path = traj.save_trace(tmp_path / "run.jsonl")
+    back = load_trace(path)
+    assert back.tool_names == traj.tool_names == ["http_get", "fs_write", "fs_read"]
+    assert [c.kwargs for c in back.calls] == [
+        {"url": "https://api.example.com/rows"},
+        {"path": "/out/r.md", "content": "total: 6"},
+        {"path": "/missing"},
+    ]
+    assert back.calls[2].error and "FileNotFoundError" in back.calls[2].error
+    assert back.final_answer == "total: 6" and back.finished
+    assert [(n.step, n.text) for n in back.notes] == [(1, "got rows")]
+    Expect(back).in_order("http_get", "fs_write").assert_all()
+
+
+def test_save_trace_is_redbg_shaped_and_gz(tmp_path):
+    import json
+
+    path = _run().save_trace(tmp_path / "run.jsonl.gz")
+    with gzip.open(path, "rt", encoding="utf-8") as fh:
+        events = [json.loads(line) for line in fh]
+    start, end = events[0], events[-1]
+    assert start["type"] == "session_start"
+    assert start["agent"] == "trajtest" and start["source"] == "trajtest"
+    assert end["type"] == "session_end" and end["status"] == "ok"
+    for e in events:
+        assert {"v", "id", "ts", "mono", "type"} <= set(e)
+    results = [e for e in events if e["type"] == "tool_result"]
+    calls = {e["id"] for e in events if e["type"] == "tool_call"}
+    assert all(r["call_id"] in calls for r in results)

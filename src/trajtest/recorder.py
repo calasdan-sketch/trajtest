@@ -87,6 +87,12 @@ class Trajectory:
         used = set(self.tool_names)
         return [t for t in registered if t not in used]
 
+    def save_trace(self, path) -> str:
+        """Write this trajectory as a redbg trace; returns the path."""
+        from trajtest.trace_io import save_trace
+
+        return save_trace(self, path)
+
     def transcript(self) -> str:
         lines = []
         for call in self.calls:

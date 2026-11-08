@@ -1,4 +1,4 @@
-"""Read redbg JSONL traces into a Trajectory (stdlib only, no redbg import).
+"""Read and write redbg JSONL traces (stdlib only, no redbg import).
 
 Lets the same Expect assertions run on a *real* recorded agent run, not just
 a mock-world run. A loaded trajectory has no mock World, so world assertions
@@ -7,6 +7,8 @@ fail with a clear message instead of passing silently.
 
 import gzip
 import json
+import uuid
+from datetime import datetime, timezone
 
 from trajtest.recorder import Note, ToolCall, Trajectory
 
@@ -76,3 +78,43 @@ def load_trace(path) -> Trajectory:
     elif status != "ok":
         traj.failure = f"session ended with status {status!r}"
     return traj
+
+
+def save_trace(traj: Trajectory, path) -> str:
+    """Write a Trajectory as a redbg trace (``.gz`` suffix -> gzip).
+
+    Args are written by parameter name; outputs are the recorded result
+    reprs (truncated like the transcript). Returns the path as a string.
+    """
+    session_id = uuid.uuid4().hex
+    clock = [0.0]
+
+    def event(etype, **fields):
+        return {
+            "v": 1, "id": uuid.uuid4().hex,
+            "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "mono": clock[0], "type": etype, "session_id": session_id, **fields,
+        }
+
+    events = [event("session_start", agent="trajtest", source="trajtest")]
+    notes = list(traj.notes)
+    for call in traj.calls:
+        events += [event("note", text=n.text) for n in notes if n.step == call.step - 1]
+        args = call.bound or {
+            **{f"arg{i}": a for i, a in enumerate(call.args)}, **call.kwargs
+        }
+        start = event("tool_call", step=call.step, tool=call.name, args=args)
+        clock[0] += call.duration_ms / 1000.0
+        result = {"output": call.result_repr} if call.error is None else {"error": call.error}
+        events += [start, event("tool_result", step=call.step, call_id=start["id"],
+                                tool=call.name, ok=call.error is None, **result)]
+    events += [event("note", text=n.text) for n in notes if n.step >= len(traj.calls)]
+    if traj.final_answer is not None:
+        events.append(event("response", text=str(traj.final_answer)))
+    ok = traj.finished and not traj.failure
+    end = {"status": "ok"} if ok else {"status": "error", "error": traj.failure}
+    events.append(event("session_end", steps=len(traj.calls), **end))
+    with _open(path, "wt") as handle:
+        for e in events:
+            handle.write(json.dumps(e, default=repr, ensure_ascii=False) + "\n")
+    return str(path)
