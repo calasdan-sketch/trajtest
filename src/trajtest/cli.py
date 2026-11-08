@@ -82,7 +82,10 @@ def cmd_run(args) -> int:
 
     # The pytest11 entry point auto-loads trajtest.pytest_plugin, so no
     # explicit -p flag (which would double-register on repeated in-process runs).
-    argv = [args.path]
+    # importlib mode: repeated in-process runs of files with the same basename
+    # (e.g. two scaffolds in different dirs) must not collide in sys.modules,
+    # which made pytest return INTERRUPTED intermittently.
+    argv = [args.path, "--import-mode=importlib", "-p", "no:cacheprovider"]
     if args.k:
         argv += ["-k", args.k]
     if args.verbose:
