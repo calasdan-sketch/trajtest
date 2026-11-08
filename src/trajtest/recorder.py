@@ -64,6 +64,8 @@ class Trajectory:
     failure: str | None = None
     max_steps: int = 25
     world: "World | None" = field(default=None, repr=False)
+    loaded_from: str | None = None
+    """Trace path when built by load_trace() (a recording, no mock World)."""
 
     @property
     def steps(self) -> int:

@@ -22,6 +22,7 @@ from trajtest.matchers import (
     StartsWith,
 )
 from trajtest.recorder import TOOLS, Note, ToolCall, Trajectory, run, sample
+from trajtest.trace_io import load_trace
 from trajtest.world import Clock, FakeFS, FakeHTTP, FakeResponse, KVStore, World
 
 __version__ = "0.1.1"
@@ -54,6 +55,7 @@ __all__ = [
     "Trajectory",
     "UnmockedRequestError",
     "World",
+    "load_trace",
     "run",
     "sample",
 ]

@@ -112,6 +112,20 @@ __startswith __endswith __gt __lt __ge __le`. Matchers (`ANY`, `Contains`,
 `Regex`, `StartsWith`, `EndsWith`, `Gt/Lt/Ge/Le`, `InstanceOf`,
 `Predicate`, `DictSubset`) compose anywhere.
 
+**load_trace(path)** — assert on a *real* recorded run. Reads a
+[redbg](https://github.com/calasdan-sketch/redbg) trace (`.jsonl` or
+`.jsonl.gz`; stdlib only, redbg is not imported): each tool call/result pair
+becomes a call with its args as keyword args, the last response becomes the
+final answer, notes stay notes, and a `session_end` status of `ok` means
+finished. A call with no recorded result gets `error="no result recorded"`.
+Call, order and answer assertions work; `world_file` / `world` raise
+`EvalFailure` because a recording has no mock World.
+
+```python
+traj = load_trace("run.jsonl")
+Expect(traj).in_order("read_file", "write_file").never_called("delete_file").assert_all()
+```
+
 **pytest plugin** — a `world` fixture (fresh `World` per test) is
 auto-registered. **CLI** — `trajtest init` scaffolds an example eval;
 `trajtest run <path>` runs evals through pytest.

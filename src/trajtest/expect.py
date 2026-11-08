@@ -79,8 +79,13 @@ class Expect:
     def _matching(self, name, args, kwargs):
         return [c for c in self.traj.calls_to(name) if call_matches(c, args, kwargs)]
 
-    def _require_world(self):
+    def _require_world(self, assertion: str):
         world = getattr(self.traj, "world", None)
+        if world is None and getattr(self.traj, "loaded_from", None):
+            raise EvalFailure(
+                f"{assertion} needs a mock World; this trajectory was loaded "
+                "from a recording"
+            )
         if world is None:
             raise ValueError(
                 "this assertion needs the mock world, but the trajectory "
@@ -299,7 +304,7 @@ class Expect:
         Pass one of equals/contains/matches (a Matcher), or none to just
         check existence.
         """
-        world = self._require_world()
+        world = self._require_world("world_file")
         desc = f"world_file({path!r})"
         try:
             content = world.fs.read(path)
@@ -329,7 +334,7 @@ class Expect:
 
         predicate(world) -> bool, or (bool, message).
         """
-        w = self._require_world()
+        w = self._require_world("world")
         ok, msg = self._coerce_result(predicate(w))
         return self._record(ok, f"world({description})", msg if not ok else "")
 
